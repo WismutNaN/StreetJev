@@ -36,7 +36,9 @@ from streetjev.infrastructure.demo import DemoExpert
 from streetjev.infrastructure.imajev import ImajevExpert
 from streetjev.infrastructure.storage import snapshot_json
 from streetjev.presentation.hotkeys import GlobalHotkeys, portable_text
+from streetjev.presentation.map_scale import format_score
 from streetjev.presentation.map_view import MapView, heat_color
+from streetjev.presentation.scores import display_scores
 from streetjev.presentation.selection import RegionOverlay
 from streetjev.presentation.worker import AnalysisWorker
 
@@ -113,8 +115,8 @@ class MainWindow(QMainWindow):
         source_layout.addWidget(self.target_label)
         self.preview = label("Здесь появится последний кадр", "muted")
         self.preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.preview.setMinimumHeight(120)
-        self.preview.setMaximumHeight(160)
+        self.preview.setMinimumHeight(90)
+        self.preview.setMaximumHeight(130)
         source_layout.addWidget(self.preview)
         controls.addWidget(source)
         self.analyze_button = QPushButton("Анализировать кадр")
@@ -142,10 +144,13 @@ class MainWindow(QMainWindow):
         self.status = label("Выберите источник и сделайте первый кадр.", "status")
         self.status.setWordWrap(True)
         controls.addWidget(self.status)
-        self.effective = label("Независимых наблюдений: 0.0", "muted")
+        self.effective = label("Вес учтённых кадров: 0.0", "muted")
         controls.addWidget(self.effective)
         self.uncertainty = label("Недостаточно данных: —", "muted")
         controls.addWidget(self.uncertainty)
+        self.agreement = label("", "muted")
+        self.agreement.setWordWrap(True)
+        controls.addWidget(self.agreement)
         controls.addStretch()
         tabs.addTab(control, "Наблюдения")
         config = QWidget()
@@ -180,10 +185,15 @@ class MainWindow(QMainWindow):
         form.addRow(hint)
         tabs.addTab(config, "Настройки")
         panel.addWidget(tabs)
-        self.ranking = QTableWidget(0, 2)
-        self.ranking.setHorizontalHeaderLabels(["Гипотеза", "Оценка"])
+        self.ranking = QTableWidget(0, 3)
+        self.ranking.setHorizontalHeaderLabels(["Гипотеза", "Раунд", "Кадр"])
+        self.ranking.setToolTip(
+            "Раунд: взвешенное среднее. Кадр: исходная оценка модели на последнем снимке.\n"
+            "Для региона показана совместная оценка страны и региона; «—» означает нет данных."
+        )
         self.ranking.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
         self.ranking.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        self.ranking.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
         self.ranking.verticalHeader().hide()
         self.ranking.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.ranking.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
@@ -193,7 +203,7 @@ class MainWindow(QMainWindow):
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setWidget(left)
-        scroll.setMinimumWidth(335)
+        scroll.setMinimumWidth(370)
         splitter.addWidget(scroll)
         right = QWidget()
         map_layout = QVBoxLayout(right)
@@ -216,21 +226,38 @@ class MainWindow(QMainWindow):
         map_layout.addLayout(map_toolbar)
         self.map = MapView(self.catalog, geography)
         self.map.country_clicked.connect(lambda _: self.level.setCurrentIndex(1))
+        view_toolbar = QHBoxLayout()
+        self.score_source = QComboBox()
+        self.score_source.addItems(["Оценки раунда", "Последний кадр"])
+        self.score_source.currentIndexChanged.connect(self.display_changed)
+        view_toolbar.addWidget(self.score_source)
+        self.color_scale = QComboBox()
+        self.color_scale.addItems(["Относительная шкала · log", "Абсолютная шкала"])
+        self.color_scale.setCurrentIndex(int(self.settings.value("color_scale", 0)))
+        self.color_scale.currentIndexChanged.connect(self.display_changed)
+        view_toolbar.addWidget(self.color_scale)
+        view_toolbar.addStretch()
+        map_layout.addLayout(view_toolbar)
         map_layout.addWidget(self.map, 1)
+        self.scale_caption = label("", "muted")
+        self.scale_caption.setWordWrap(True)
+        map_layout.addWidget(self.scale_caption)
         legend = QHBoxLayout()
-        for probability in (0.0, 0.02, 0.1, 0.4, 0.7, 1.0):
-            dot = label(f"  {probability:.0%}  ")
-            dot.setStyleSheet(f"background: {heat_color(probability).name()}; border-radius: 4px; padding: 4px;")
+        self.legend_labels = []
+        for _ in range(6):
+            dot = label("")
+            self.legend_labels.append(dot)
             legend.addWidget(dot)
         map_layout.addLayout(legend)
+        self.map.scale_changed.connect(self.update_legend)
         map_layout.addWidget(
             label("Колесо — масштаб · перетаскивание — перемещение · двойной щелчок — регионы страны", "muted")
         )
         map_layout.addWidget(
-            label("Границы: Natural Earth · регион без наблюдений сохраняет заливку страны", "muted")
+            label("Серый — нет данных или нижняя граница шкалы · оценки не откалиброваны · Natural Earth", "muted")
         )
         splitter.addWidget(right)
-        splitter.setSizes([370, 960])
+        splitter.setSizes([410, 920])
         root.addWidget(splitter, 1)
         self.setCentralWidget(container)
         self.set_mode_ui()
@@ -440,32 +467,78 @@ class MainWindow(QMainWindow):
 
     def update_snapshot(self):
         snapshot = self.session.round.snapshot()
+        self.map.source = "last" if self.score_source.currentIndex() else "round"
+        self.map.scale_mode = "absolute" if self.color_scale.currentIndex() else "relative"
         self.map.update_snapshot(snapshot)
         self.frames_label.setText(f"{snapshot.frames} кадров")
-        self.effective.setText(f"Независимых наблюдений: {snapshot.effective_frames:.2f}")
+        self.effective.setText(f"Вес учтённых кадров: {snapshot.effective_frames:.2f}")
         self.uncertainty.setText(
-            f"Неизвестность последнего кадра: {snapshot.last_unknown:.0%}"
+            f"«Не знаю» у модели на кадре: {format_score(snapshot.last_unknown)}"
             if snapshot.frames
-            else "Неизвестность последнего кадра: —"
+            else "«Не знаю» у модели на кадре: —"
         )
+        if snapshot.known_frames == 0:
+            self.agreement.setText("Пока нет географических наблюдений.")
+        elif snapshot.known_frames == 1:
+            self.agreement.setText("Один кадр. Проверки другими ракурсами пока нет.")
+        else:
+            self.agreement.setText(
+                f"Лидер раунда был первым в {snapshot.agreeing_frames} из "
+                f"{snapshot.known_frames} кадров. Совпадение не гарантирует правильность."
+            )
+        selected = display_scores(snapshot, self.map.source)
         regional = self.level.currentIndex() == 1
         places = self.catalog.regions if regional else self.catalog.countries
-        probabilities = snapshot.regions if regional else snapshot.countries
+        probabilities = selected.regions if regional else selected.countries
         if regional:
             probabilities = {
-                k: p for k, p in probabilities.items() if places[k].country_code in snapshot.observed_regions
+                k: p for k, p in probabilities.items() if places[k].country_code in selected.observed_regions
             }
         ranked = sorted(probabilities.items(), key=lambda pair: pair[1], reverse=True)[:8]
-        self.ranking.setRowCount(len(ranked) if snapshot.effective_frames else 0)
-        if snapshot.effective_frames:
-            for row, (key, probability) in enumerate(ranked):
+        self.ranking.setRowCount(len(ranked) if selected.active else 0)
+        if selected.active:
+            for row, (key, _probability) in enumerate(ranked):
                 name = places[key].label
                 if regional:
                     name += " · " + places[key].country_code
                 item = QTableWidgetItem(name)
                 item.setData(Qt.ItemDataRole.UserRole, places[key].country_code or key)
                 self.ranking.setItem(row, 0, item)
-                self.ranking.setItem(row, 1, QTableWidgetItem(f"{probability:.1%}"))
+                for column, source in ((1, "round"), (2, "last")):
+                    scores = display_scores(snapshot, source)
+                    available = scores.active and (
+                        not regional or places[key].country_code in scores.observed_regions
+                    )
+                    value = (scores.regions if regional else scores.countries).get(key, 0)
+                    self.ranking.setItem(row, column, QTableWidgetItem(format_score(value) if available else "—"))
+
+    def display_changed(self):
+        self.update_snapshot()
+
+    def update_legend(self, scale):
+        ticks = scale.legend()
+        for index, dot in enumerate(self.legend_labels):
+            dot.setVisible(index < len(ticks))
+            if index < len(ticks):
+                intensity, text = ticks[index]
+                dot.setText(text)
+                foreground = "#102920" if intensity >= 0.4 else "#dce7ef"
+                dot.setStyleSheet(
+                    f"background: {heat_color(intensity).name()}; color: {foreground}; "
+                    "border-radius: 4px; padding: 5px;"
+                )
+        if scale.empty:
+            message = "Для этого слоя ещё нет оценок."
+        elif scale.flat:
+            message = "Оценки равны — цветом нечего выделить."
+        elif scale.mode == "relative":
+            message = (
+                f"Относительный контраст · максимум слоя {format_score(scale.maximum)}. "
+                "В легенде реальные оценки, яркость не означает достоверность."
+            )
+        else:
+            message = "Абсолютная шкала оценок 0–100%. Оценка модели не равна вероятности правильного ответа."
+        self.scale_caption.setText(message)
 
     def level_changed(self):
         if hasattr(self, "map"):
@@ -473,9 +546,9 @@ class MainWindow(QMainWindow):
             self.update_snapshot()
 
     def focus_leader(self):
-        snapshot = self.session.round.snapshot()
-        if snapshot.effective_frames:
-            self.map.focus_country(max(snapshot.countries, key=snapshot.countries.get))
+        scores = display_scores(self.session.round.snapshot(), self.map.source)
+        if scores.active:
+            self.map.focus_country(max(scores.countries, key=scores.countries.get))
 
     def focus_ranked(self, row, column):
         item = self.ranking.item(row, 0)
@@ -521,6 +594,7 @@ class MainWindow(QMainWindow):
             "interval": self.interval.value(),
             "capture_key": portable_text(self.capture_key),
             "reset_key": portable_text(self.reset_key),
+            "color_scale": self.color_scale.currentIndex(),
         }.items():
             self.settings.setValue(name, value)
         self.settings.sync()

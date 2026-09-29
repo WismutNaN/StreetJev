@@ -1,28 +1,29 @@
 import math
 from copy import copy
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from uuid import uuid4
 
 from streetjev.domain.evidence import Distribution, Frame, GeoEvidence
 from streetjev.domain.geography import GeoCatalog
 
+AGGREGATION_VERSION = "weighted_linear_v2"
 
-def update_posterior(previous: dict[str, float], evidence: Distribution, weight: float) -> dict[str, float]:
-    """Log-space Bayes, равномерный prior; неизвестный ответ ослабляет вес."""
+
+def pool_scores(
+    previous: dict[str, float], previous_weight: float, evidence: Distribution, weight: float
+) -> dict[str, float]:
+    """Линейное объединение: результат лежит между оценками отдельных кадров."""
     if set(previous) != set(evidence.probabilities):
         raise ValueError("Набор гипотез изменился внутри раунда")
+    if not math.isfinite(previous_weight) or previous_weight < 0 or not math.isfinite(weight) or weight < 0:
+        raise ValueError("Некорректный вес наблюдения")
     strength = weight * (1 - evidence.unknown)
     if strength == 0:
         return previous.copy()
-    size = len(previous)
-    scores = {
-        key: math.log(max(value, 1e-300)) + strength * math.log(max(evidence.probabilities[key], 1e-8) * size)
-        for key, value in previous.items()
+    fraction = strength / (previous_weight + strength)
+    return {
+        key: (1 - fraction) * value + fraction * evidence.probabilities[key] for key, value in previous.items()
     }
-    maximum = max(scores.values())
-    exp = {key: math.exp(value - maximum) for key, value in scores.items()}
-    total = math.fsum(exp.values())
-    return {key: value / total for key, value in exp.items()}
 
 
 @dataclass(frozen=True)
@@ -34,6 +35,12 @@ class RoundSnapshot:
     regions: dict[str, float]
     observed_regions: frozenset[str]
     last_unknown: float
+    aggregation: str = AGGREGATION_VERSION
+    last_countries: dict[str, float] = field(default_factory=dict)
+    last_regions: dict[str, float] = field(default_factory=dict)
+    last_observed_regions: frozenset[str] = frozenset()
+    known_frames: int = 0
+    agreeing_frames: int = 0
 
 
 class GeoRound:
@@ -49,6 +56,10 @@ class GeoRound:
             if (regions := catalog.regions_of(key))
         }
         self.observed_regions: set[str] = set()
+        self._region_weights = {key: 0.0 for key in self.region_conditionals}
+        self._last_evidence: GeoEvidence | None = None
+        self._leader_votes = {key: 0 for key in catalog.countries}
+        self.known_frames = 0
         self.frames = 0
         self.effective_frames = 0.0
         self.last_unknown = 1.0
@@ -78,20 +89,32 @@ class GeoRound:
         if novelty == 0:
             return False
         # Вычисляем всё до изменения агрегата: неверный регион не оставит частичный update.
-        countries = update_posterior(self.countries, evidence.countries, novelty)
+        countries = pool_scores(self.countries, self.effective_frames, evidence.countries, novelty)
         conditionals = self.region_conditionals.copy()
         observed = self.observed_regions.copy()
+        region_weights = self._region_weights.copy()
         for country, distribution in evidence.regions.items():
             if country not in conditionals:
                 raise ValueError("Неизвестная страна в региональном наблюдении")
             # Региональный ответ условный: слабая гипотеза страны не должна закреплять регион.
             weight = novelty * (1 - evidence.countries.unknown) * evidence.countries.probabilities[country]
-            conditionals[country] = update_posterior(conditionals[country], distribution, weight)
+            conditionals[country] = pool_scores(
+                conditionals[country], region_weights[country], distribution, weight
+            )
+            region_weights[country] += weight * (1 - distribution.unknown)
             if weight * (1 - distribution.unknown) > 0:
                 observed.add(country)
         self.countries = countries
         self.region_conditionals = conditionals
         self.observed_regions = observed
+        self._region_weights = region_weights
+        self._last_evidence = evidence
+        self._leader_votes = self._leader_votes.copy()
+        if evidence.countries.unknown < 1:
+            self.known_frames += 1
+            ranked = sorted(evidence.countries.probabilities.items(), key=lambda pair: pair[1], reverse=True)
+            if len(ranked) == 1 or ranked[0][1] - ranked[1][1] > 1e-12:
+                self._leader_votes[ranked[0][0]] += 1
         self.frames += 1
         self.effective_frames += novelty * (1 - evidence.countries.unknown)
         self.last_unknown = evidence.countries.unknown
@@ -110,6 +133,7 @@ class GeoRound:
         return candidate if candidate.accept(round_id, frame, evidence, novelty) else None
 
     def snapshot(self) -> RoundSnapshot:
+        last = self._last_evidence
         return RoundSnapshot(
             self.id,
             self.frames,
@@ -122,4 +146,23 @@ class GeoRound:
             },
             frozenset(self.observed_regions),
             self.last_unknown,
+            last_countries=dict(last.countries.probabilities) if last else {},
+            last_regions={
+                region: last.countries.probabilities[country] * probability
+                for country, distribution in last.regions.items()
+                for region, probability in distribution.probabilities.items()
+            }
+            if last
+            else {},
+            last_observed_regions=frozenset(
+                country
+                for country, distribution in last.regions.items()
+                if distribution.unknown < 1 and last.countries.unknown < 1
+            )
+            if last
+            else frozenset(),
+            known_frames=self.known_frames,
+            agreeing_frames=self._leader_votes[max(self.countries, key=self.countries.get)]
+            if self.known_frames
+            else 0,
         )

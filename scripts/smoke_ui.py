@@ -3,12 +3,15 @@
 import os
 import time
 from pathlib import Path
+from uuid import uuid4
 
 os.environ["QT_QPA_PLATFORM"] = "offscreen"
 
 from PySide6.QtGui import QFontDatabase
 from PySide6.QtWidgets import QApplication
 
+from streetjev.application.session import AnalysisResult
+from streetjev.domain.evidence import Distribution, Frame, GeoEvidence
 from streetjev.infrastructure.catalog import load_geography
 from streetjev.infrastructure.storage import SqliteRoundRepository
 from streetjev.presentation.style import STYLE
@@ -40,7 +43,16 @@ def main():
             time.sleep(0.01)
         assert not window.busy, "Фоновый анализ завис"
     assert window.session.round.frames == 3
+    saved_scores = window.session.round.snapshot().countries
     window.grab().save(str(output / "countries.png"))
+    window.color_scale.setCurrentIndex(1)
+    assert window.map.heat_scale.mode == "absolute"
+    window.score_source.setCurrentIndex(1)
+    assert window.map.source == "last"
+    assert window.ranking.columnCount() == 3
+    assert window.session.round.snapshot().countries == saved_scores
+    window.score_source.setCurrentIndex(0)
+    window.color_scale.setCurrentIndex(0)
     window.level.setCurrentIndex(1)
     window.map.focus_country("AT")
     app.processEvents()
@@ -54,9 +66,37 @@ def main():
         time.sleep(0.01)
     assert not window.busy
     assert window.session.round.frames == 0
+    assert window.map.heat_scale.empty
+    # Малая совместная масса регионов: лидер слоя меньше 0.1%, но география различима.
+    fixture = GeoEvidence(
+        "demo",
+        "scale-smoke",
+        Distribution(dict.fromkeys(catalog.countries, 1.0)),
+        {"AT": Distribution({region.code: index + 1 for index, region in enumerate(catalog.regions_of("AT"))})},
+        "{}",
+        0,
+    )
+    test_frame = Frame(uuid4().hex, b"", b"test", "2026-09-30", "Тест шкалы")
+    window.session.accept(AnalysisResult(window.session.round.id, test_frame, fixture, 1))
+    window.update_snapshot()
+    app.processEvents()
+    assert window.map.heat_scale.maximum < 0.001
+    highest_region = max(
+        window.session.round.snapshot().last_regions, key=window.session.round.snapshot().last_regions.get
+    )
+    assert window.map.items_by_code[highest_region].brush().color().name() == "#fb6f50"
+    assert window.map.items_by_code["DE"].brush().color().name() == "#192a37"
+    before_zoom = window.map.heat_scale
+    window.map.focus_country("AT")
+    assert window.map.heat_scale == before_zoom
+    window.grab().save(str(output / "low-regions.png"))
+    window.color_scale.setCurrentIndex(1)
+    assert window.map.items_by_code[highest_region].brush().color().name() != "#fb6f50"
+    window.grab().save(str(output / "low-regions-absolute.png"))
+    window.color_scale.setCurrentIndex(0)
     window.close()
     app.processEvents()
-    print("UI smoke: демо, фоновая обработка, карта регионов и сброс во время запроса — OK")
+    print("UI smoke: фоновые задачи, сброс, раунд/кадр, обе шкалы и контраст малых региональных оценок — OK")
 
 
 if __name__ == "__main__":

@@ -4,14 +4,14 @@ import pytest
 from conftest import evidence, frame
 
 from streetjev.domain.evidence import Distribution
-from streetjev.domain.round import GeoRound, update_posterior
+from streetjev.domain.round import GeoRound, pool_scores
 
 
-def test_independent_observations_accumulate(catalog):
+def test_repeated_opinions_do_not_manufacture_certainty(catalog):
     state = GeoRound(catalog)
     state.accept(state.id, frame(), evidence(), 1)
     state.accept(state.id, frame(255, "second"), evidence(), 1)
-    assert state.countries["AT"] == pytest.approx(16 / 17)
+    assert state.countries["AT"] == pytest.approx(0.8)
     assert math.fsum(state.countries.values()) == pytest.approx(1)
 
 
@@ -64,15 +64,82 @@ def test_invalid_probabilities_rejected(probabilities, unknown):
         Distribution(probabilities, unknown)
 
 
-def test_long_sequence_stays_finite_and_can_reverse():
-    posterior = {"AT": 0.5, "DE": 0.5}
+def test_long_sequence_stays_bounded_and_can_reverse():
+    scores, weight = {"AT": 0.5, "DE": 0.5}, 0.0
     for _ in range(1000):
-        posterior = update_posterior(posterior, Distribution({"AT": 1, "DE": 0}), 0.5)
+        scores = pool_scores(scores, weight, Distribution({"AT": 0.8, "DE": 0.2}), 0.5)
+        weight += 0.5
+    assert scores["AT"] == pytest.approx(0.8)
     for _ in range(1100):
-        posterior = update_posterior(posterior, Distribution({"AT": 0, "DE": 1}), 0.5)
-    assert all(math.isfinite(p) for p in posterior.values())
-    assert sum(posterior.values()) == pytest.approx(1)
-    assert posterior["DE"] > 0.99
+        scores = pool_scores(scores, weight, Distribution({"AT": 0.2, "DE": 0.8}), 0.5)
+        weight += 0.5
+    assert all(math.isfinite(p) for p in scores.values())
+    assert sum(scores.values()) == pytest.approx(1)
+    assert 0.5 < scores["DE"] < 0.8
+
+
+def test_conflicting_frames_remain_ambiguous(catalog):
+    state = GeoRound(catalog)
+    state.accept(state.id, frame(), evidence(at=0.9), 1)
+    state.accept(state.id, frame(255, "second"), evidence(at=0.1), 1)
+    snapshot = state.snapshot()
+    assert snapshot.countries["AT"] == pytest.approx(0.5)
+    assert snapshot.last_countries["AT"] == pytest.approx(0.1)
+    assert snapshot.known_frames == 2
+    assert snapshot.agreeing_frames == 1
+
+
+def test_weight_uses_novelty_and_unknown(catalog):
+    state = GeoRound(catalog)
+    state.accept(state.id, frame(), evidence(at=0.8), 1)
+    state.accept(state.id, frame(255, "second"), evidence(at=0.1, unknown=0.5), 0.5)
+    assert state.effective_frames == 1.25
+    assert state.countries["AT"] == pytest.approx((0.8 + 0.25 * 0.1) / 1.25)
+
+
+def test_unknown_after_valid_frame_does_not_erase_knowledge(catalog):
+    state = GeoRound(catalog)
+    state.accept(state.id, frame(), evidence(), 1)
+    state.accept(state.id, frame(255, "unknown"), evidence(at=0, unknown=1), 1)
+    snapshot = state.snapshot()
+    assert snapshot.countries["AT"] == pytest.approx(0.8)
+    assert snapshot.known_frames == 1
+    assert snapshot.last_unknown == 1
+
+
+def test_regions_are_pooled_without_promoting_country(catalog):
+    state = GeoRound(catalog)
+    first = evidence(at=0.4, regions={"AT": Distribution({"AT-7": 0.9, "AT-5": 0.1})})
+    second = evidence(at=0.8, regions={"AT": Distribution({"AT-7": 0.3, "AT-5": 0.7})})
+    state.accept(state.id, frame(), first, 1)
+    state.accept(state.id, frame(255, "second"), second, 1)
+    snapshot = state.snapshot()
+    assert snapshot.countries["AT"] == pytest.approx(0.6)
+    conditional = (0.4 * 0.9 + 0.8 * 0.3) / 1.2
+    assert snapshot.regions["AT-7"] == pytest.approx(0.6 * conditional)
+    assert snapshot.last_regions["AT-7"] == pytest.approx(0.8 * 0.3)
+
+
+def test_pooling_is_order_independent(catalog):
+    rows = [(0.8, 0.2, 1), (0.3, 0.0, 0.5), (0.5, 0.6, 0.8)]
+
+    def combined(rows):
+        state = GeoRound(catalog)
+        for i, (score, unknown, weight) in enumerate(rows):
+            state.accept(state.id, frame(i, str(i)), evidence(at=score, unknown=unknown), weight)
+        return state.countries
+
+    assert combined(rows) == pytest.approx(combined(list(reversed(rows))))
+
+
+def test_snapshot_copies_are_detached_from_aggregate(catalog):
+    state = GeoRound(catalog)
+    state.accept(state.id, frame(), evidence(), 1)
+    snapshot = state.snapshot()
+    snapshot.countries["AT"] = 0
+    snapshot.last_countries["AT"] = 0
+    assert state.snapshot().countries["AT"] == pytest.approx(0.8)
+    assert state.snapshot().last_countries["AT"] == pytest.approx(0.8)
 
 
 def test_distribution_is_immutable():

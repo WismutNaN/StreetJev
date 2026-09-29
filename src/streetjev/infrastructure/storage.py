@@ -11,6 +11,7 @@ from streetjev.domain.round import RoundSnapshot
 def snapshot_json(snapshot: RoundSnapshot) -> str:
     data = asdict(snapshot)
     data["observed_regions"] = sorted(snapshot.observed_regions)
+    data["last_observed_regions"] = sorted(snapshot.last_observed_regions)
     return json.dumps(data, ensure_ascii=False)
 
 

@@ -16,6 +16,8 @@ def test_persistence_reset_and_late_reply(catalog, tmp_path):
     assert session.accept(result)
     stored = repo.connection.execute("SELECT snapshot FROM rounds WHERE id = ?", (old_id,)).fetchone()
     assert json.loads(stored[0])["frames"] == 1
+    assert json.loads(stored[0])["aggregation"] == "weighted_linear_v2"
+    assert json.loads(stored[0])["last_countries"]["AT"] == pytest.approx(0.8)
     session.reset()
     assert not session.accept(result)
     assert session.round.frames == 0

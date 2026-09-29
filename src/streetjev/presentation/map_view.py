@@ -7,6 +7,8 @@ from PySide6.QtWidgets import QGraphicsPathItem, QGraphicsScene, QGraphicsView
 
 from streetjev.domain.geography import GeoCatalog
 from streetjev.domain.round import RoundSnapshot
+from streetjev.presentation.map_scale import HeatScale, format_score
+from streetjev.presentation.scores import display_scores
 
 
 def project(lon, lat):
@@ -14,8 +16,8 @@ def project(lon, lat):
     return lon, -math.degrees(math.log(math.tan(math.pi / 4 + math.radians(lat) / 2)))
 
 
-def heat_color(probability):
-    # Абсолютная шкала, нелинейная для видимости слабых гипотез. Не min-max по кадру.
+def heat_color(intensity):
+    # Палитра общая; преобразование реальной оценки в интенсивность выполняет HeatScale.
     stops = [
         (0, (25, 42, 55)),
         (0.02, (34, 70, 92)),
@@ -25,14 +27,15 @@ def heat_color(probability):
         (1, (251, 111, 80)),
     ]
     for (a, ca), (b, cb) in pairwise(stops):
-        if probability <= b:
-            t = max(0, (probability - a) / (b - a))
+        if intensity <= b:
+            t = max(0, (intensity - a) / (b - a))
             return QColor(*(round(x + (y - x) * t) for x, y in zip(ca, cb)))
     return QColor(*stops[-1][1])
 
 
 class MapView(QGraphicsView):
     country_clicked = Signal(str)
+    scale_changed = Signal(object)
 
     def __init__(self, catalog: GeoCatalog, geography: dict):
         super().__init__()
@@ -46,6 +49,9 @@ class MapView(QGraphicsView):
         self.items_by_code = {}
         self.country_bounds = {}
         self.level = "countries"
+        self.source = "round"
+        self.scale_mode = "relative"
+        self.heat_scale = HeatScale.from_scores([])
         self.snapshot = None
         self.auto_fit = True
         for feature in geography["features"]:
@@ -119,23 +125,40 @@ class MapView(QGraphicsView):
 
     def update_snapshot(self, snapshot: RoundSnapshot):
         self.snapshot = snapshot
-        active = snapshot.effective_frames > 0
+        scores = display_scores(snapshot, self.source)
+        active = scores.active
+        values = (
+            scores.countries
+            if self.level == "countries"
+            else {
+                code: value
+                for code, value in scores.regions.items()
+                if self.catalog.regions[code].country_code in scores.observed_regions
+            }
+        )
+        self.heat_scale = HeatScale.from_scores(values.values() if active else [], self.scale_mode)
         for code, item in self.items_by_code.items():
             country = item.data(1)
             if country:
-                visible = self.level == "regions" and country in snapshot.observed_regions and active
+                visible = self.level == "regions" and country in scores.observed_regions and active
                 item.setVisible(visible)
-                probability = snapshot.regions.get(code, 0)
+                probability = scores.regions.get(code, 0)
                 label = self.catalog.regions[code].label
             else:
-                probability = snapshot.countries[code]
+                probability = scores.countries.get(code, 0)
                 label = self.catalog.countries[code].label
-            fill = probability if active else 0
-            if not country and self.level == "regions" and code in snapshot.observed_regions:
-                # Admin-0 и admin-1 имеют разный масштаб: нейтральный фон скрывает ложные горячие щели.
+            fill = self.heat_scale.intensity(probability) if active else 0
+            if not country and self.level == "regions":
+                # Массу страны нельзя окрашивать по общей шкале совместных региональных оценок.
                 fill = 0
             item.setBrush(QBrush(heat_color(fill)))
-            suffix = f"{probability:.1%}" if active else "пока нет наблюдений"
-            if not country and self.level == "regions" and code not in snapshot.observed_regions:
-                suffix += " · регион не определён"
-            item.setToolTip(f"{label}\n{suffix}")
+            suffix = f"Оценка: {format_score(probability)}" if active else "Пока нет наблюдений"
+            if country and active:
+                country_score = scores.countries.get(country, 0)
+                conditional = probability / country_score if country_score else 0
+                suffix += f"\nВнутри страны: {format_score(conditional)}; страна: {format_score(country_score)}"
+            if not country and self.level == "regions" and code not in scores.observed_regions:
+                suffix += "\nРегион не анализировался"
+            caption = "Раунд" if self.source == "round" else "Последний кадр"
+            item.setToolTip(f"{label} · {caption}\n{suffix}\nОценки модели, не вероятность правильного ответа")
+        self.scale_changed.emit(self.heat_scale)

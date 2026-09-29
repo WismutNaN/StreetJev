@@ -14,7 +14,7 @@
 **Статус:** [x] Готово. **Размер:** M.
 Контекст: структура готова; строится накопление по административным классам.
 
-- [x] Log-space posterior, unknown, novelty, reset (→ [ядро](../modules/core.md)).
+- [x] Взвешенное среднее оценок, unknown, novelty, reset (→ [ядро](../modules/core.md)).
 - [x] SQLite и неизменённые ответы модели (→ [инфраструктура](../modules/adapters.md)).
 - Проверки: нормировка, дубликаты, запоздавший результат, атомарность при ошибке БД.
 
@@ -27,6 +27,8 @@
 - [x] Официальный API, country + region beam (→ [инфраструктура](../modules/adapters.md)).
 - [x] Локальное управление сервисом (→ [сервис](../services/imajev/README.md)).
 - [x] Карта 240 стран и 4 580 регионов (→ [desktop](../modules/desktop.md)).
+- [x] Оценки раунда и кадра, относительная логарифмическая и абсолютная шкалы
+  (→ [ADR-0005](adr/0005-confidence-and-map-scale.md)).
 - Проверки: HTTP contract, UI smoke, Windows capture и реальный GPU pipeline прошли;
   детали и ограничения — [журнал проверки](VERIFICATION.md).
 
