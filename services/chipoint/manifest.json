@@ -1,0 +1,12 @@
+{
+  "model_repo": "chiikabu-labs/chipoint-2",
+  "revision": "a150120cd968d48310d092caf26854f109c90b51",
+  "reference": "https://huggingface.co/spaces/chiikabu-labs/chipoint-v2-geolocation/blob/65dd8df82f36608ad819f5ecd4371da16f73704e/app.py",
+  "default_towers": ["so400m256"],
+  "encoders": {
+    "so400m256": {"repo": "timm/ViT-SO400M-16-SigLIP2-256", "revision": "8b4c2efdfd48e0d72644df99ed5dc20c110fc352"},
+    "gopt": {"repo": "timm/ViT-gopt-16-SigLIP2-256", "revision": "bda0197e1c5816f592548007d24019e4b6b3b686"}
+  },
+  "mode": "street_retrieval",
+  "reranker": false
+}

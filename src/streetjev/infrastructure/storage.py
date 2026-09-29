@@ -15,6 +15,20 @@ def snapshot_json(snapshot: RoundSnapshot) -> str:
     return json.dumps(data, ensure_ascii=False)
 
 
+def evidence_json(evidence: GeoEvidence) -> str:
+    return json.dumps(
+        {
+            "countries": dict(evidence.countries.probabilities),
+            "unknown": evidence.countries.unknown,
+            "regions": {
+                k: {"probabilities": dict(v.probabilities), "unknown": v.unknown}
+                for k, v in evidence.regions.items()
+            },
+        },
+        ensure_ascii=False,
+    )
+
+
 class SqliteRoundRepository:
     def __init__(self, path: Path):
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -32,6 +46,12 @@ class SqliteRoundRepository:
                 evidence TEXT NOT NULL, raw_json TEXT NOT NULL
             );
             CREATE INDEX IF NOT EXISTS observations_round ON observations(round_id);
+            CREATE TABLE IF NOT EXISTS supplementary_observations (
+                frame_id TEXT NOT NULL REFERENCES observations(frame_id), expert TEXT NOT NULL,
+                model_version TEXT NOT NULL, elapsed_ms REAL NOT NULL, evidence TEXT NOT NULL,
+                raw_json TEXT NOT NULL, weight REAL NOT NULL, active INTEGER NOT NULL DEFAULT 1,
+                PRIMARY KEY (frame_id, expert)
+            );
         """)
 
     def start(self, snapshot: RoundSnapshot) -> None:
@@ -72,3 +92,32 @@ class SqliteRoundRepository:
 
     def close(self):
         self.connection.close()
+
+    def supplement(self, snapshot: RoundSnapshot, frame: Frame, evidence: GeoEvidence, weight: float) -> None:
+        with self.connection:
+            self.connection.execute(
+                "INSERT INTO supplementary_observations VALUES (?, ?, ?, ?, ?, ?, ?, 1)",
+                (
+                    frame.id,
+                    evidence.source,
+                    evidence.model_version,
+                    evidence.elapsed_ms,
+                    evidence_json(evidence),
+                    evidence.raw_json,
+                    weight,
+                ),
+            )
+            self.connection.execute(
+                "UPDATE rounds SET snapshot = ? WHERE id = ?", (snapshot_json(snapshot), snapshot.id)
+            )
+
+    def disable_supplements(self, snapshot: RoundSnapshot) -> None:
+        with self.connection:
+            self.connection.execute(
+                "UPDATE supplementary_observations SET active = 0 WHERE frame_id IN "
+                "(SELECT frame_id FROM observations WHERE round_id = ?)",
+                (snapshot.id,),
+            )
+            self.connection.execute(
+                "UPDATE rounds SET snapshot = ? WHERE id = ?", (snapshot_json(snapshot), snapshot.id)
+            )

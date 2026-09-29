@@ -6,14 +6,19 @@ import sqlite3
 from pathlib import Path
 
 from streetjev.domain.evidence import Distribution, Frame, GeoEvidence
+from streetjev.domain.fusion import fuse_evidence
 from streetjev.domain.round import GeoRound
 from streetjev.infrastructure.catalog import load_geography
 
 
-def replay(database: Path) -> list[dict]:
+def replay(database: Path, imajev_only=False) -> list[dict]:
     catalog, _ = load_geography()
     connection = sqlite3.connect(database.resolve().as_uri() + "?mode=ro", uri=True)
     reports = []
+    has_supplements = (
+        connection.execute("SELECT 1 FROM sqlite_master WHERE name='supplementary_observations'").fetchone()
+        is not None
+    )
     try:
         for round_id, saved in connection.execute("SELECT id, snapshot FROM rounds ORDER BY rowid"):
             stored = json.loads(saved)
@@ -37,6 +42,27 @@ def replay(database: Path) -> list[dict]:
                     raw,
                     elapsed_ms,
                 )
+                if has_supplements and not imajev_only:
+                    row = connection.execute(
+                        "SELECT expert, model_version, evidence, raw_json, elapsed_ms, weight "
+                        "FROM supplementary_observations WHERE frame_id = ? AND active = 1",
+                        (frame_id,),
+                    ).fetchone()
+                    if row:
+                        expert2, model2, encoded2, raw2, elapsed2, weight2 = row
+                        data2 = json.loads(encoded2)
+                        other = GeoEvidence(
+                            expert2,
+                            model2,
+                            Distribution(data2["countries"], data2["unknown"]),
+                            {
+                                code: Distribution(value["probabilities"], value["unknown"])
+                                for code, value in data2["regions"].items()
+                            },
+                            raw2,
+                            elapsed2,
+                        )
+                        evidence = fuse_evidence(evidence, other, weight2)
                 # Изображения не сохранены: используем записанный вес, novelty повторно не вычисляем.
                 frame = Frame(frame_id, b"", frame_id.encode(), captured_at, source)
                 state.accept(state.id, frame, evidence, novelty)
@@ -63,10 +89,11 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--database", type=Path, default=Path("data/rounds.sqlite3"))
     parser.add_argument("--output", type=Path, default=Path("artifacts/confidence-replay.json"))
+    parser.add_argument("--imajev-only", action="store_true", help="сравнить с основным экспертом без Chipoint")
     args = parser.parse_args()
     if args.output.resolve() == args.database.resolve():
         parser.error("Выходной файл не может заменять исходную БД")
-    result = replay(args.database)
+    result = replay(args.database, args.imajev_only)
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
     for item in result:

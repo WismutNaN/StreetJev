@@ -7,11 +7,13 @@ from uuid import uuid4
 
 os.environ["QT_QPA_PLATFORM"] = "offscreen"
 
+from PIL import Image
 from PySide6.QtGui import QFontDatabase
 from PySide6.QtWidgets import QApplication
 
 from streetjev.application.session import AnalysisResult
 from streetjev.domain.evidence import Distribution, Frame, GeoEvidence
+from streetjev.infrastructure.capture import prepare_image
 from streetjev.infrastructure.catalog import load_geography
 from streetjev.infrastructure.storage import SqliteRoundRepository
 from streetjev.presentation.style import STYLE
@@ -94,6 +96,20 @@ def main():
     assert window.map.items_by_code[highest_region].brush().color().name() != "#fb6f50"
     window.grab().save(str(output / "low-regions-absolute.png"))
     window.color_scale.setCurrentIndex(0)
+    window.resize(1000, 600)
+    app.processEvents()
+    assert window.width() == 1000 and window.height() == 600
+    assert window.sidebar.height() <= window.map.height()
+    window.grab().save(str(output / "compact-1000.png"))
+    preview_frame = prepare_image(Image.new("RGB", (640, 420), "#557d89"), "Синтетический preview")
+    window.show_frame(window.session.round.id, preview_frame)
+    app.processEvents()
+    assert window.sidebar.height() > window.preview.height() + window.ranking.height()
+    window.grab().save(str(output / "preview-1000.png"))
+    window.show_settings()
+    app.processEvents()
+    window.settings_dialog.grab().save(str(output / "settings.png"))
+    window.settings_dialog.close()
     window.close()
     app.processEvents()
     print("UI smoke: фоновые задачи, сброс, раунд/кадр, обе шкалы и контраст малых региональных оценок — OK")

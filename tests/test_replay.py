@@ -2,6 +2,7 @@ import json
 import sqlite3
 import subprocess
 import sys
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -50,3 +51,37 @@ def test_replay_leaves_original_database_intact(tmp_path):
     assert database.read_bytes() == before
     with sqlite3.connect(database) as connection:
         assert connection.execute("SELECT count(*) FROM observations").fetchone()[0] == 3
+
+
+def test_replay_fusion_and_primary_comparison(tmp_path):
+    database = tmp_path / "fusion.sqlite3"
+    catalog, _ = load_geography()
+    repo = SqliteRoundRepository(database)
+    session = Session(catalog, repo)
+    probabilities = dict.fromkeys(catalog.countries, 0.0)
+    probabilities.update(AT=0.9, DE=0.1)
+    primary = GeoEvidence("imajev", "test", Distribution(probabilities), {}, "{}", 0)
+    probabilities.update(AT=0.1, DE=0.9)
+    other = replace(primary, source="chipoint", countries=Distribution(probabilities))
+    frame = Frame("one", b"", b"test", "2026-09-30", "test")
+    session.accept(AnalysisResult(session.round.id, frame, primary, 1))
+    session.supplement(AnalysisResult(session.round.id, frame, other, 1))
+    repo.close()
+    before = database.read_bytes()
+    for options, expected in (([], 0.62), (["--imajev-only"], 0.9)):
+        output = tmp_path / "report.json"
+        subprocess.run(
+            [
+                sys.executable,
+                str(Path(__file__).resolve().parents[1] / "scripts/replay_rounds.py"),
+                "--database",
+                str(database),
+                "--output",
+                str(output),
+                *options,
+            ],
+            check=True,
+            capture_output=True,
+        )
+        assert json.loads(output.read_text(encoding="utf-8"))[0]["new_score"] == pytest.approx(expected)
+    assert database.read_bytes() == before

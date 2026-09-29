@@ -9,6 +9,7 @@ dependencies = [
     "mss>=10,<11",
     "pillow>=11,<13",
     "pyside6>=6.8,<7",
+    "shapely>=2,<3",
 ]
 
 [dependency-groups]

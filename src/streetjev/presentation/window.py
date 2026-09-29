@@ -4,58 +4,36 @@ from pathlib import Path
 
 from PIL import Image
 from PySide6.QtCore import QSettings, Qt, QThreadPool, QTimer
-from PySide6.QtGui import QKeySequence, QPixmap
+from PySide6.QtGui import QPixmap
 from PySide6.QtWidgets import (
     QApplication,
-    QCheckBox,
-    QComboBox,
     QFileDialog,
-    QFormLayout,
-    QGroupBox,
-    QHBoxLayout,
-    QHeaderView,
     QInputDialog,
-    QKeySequenceEdit,
-    QLabel,
-    QLineEdit,
     QMainWindow,
-    QPushButton,
-    QScrollArea,
-    QSpinBox,
-    QSplitter,
-    QTableWidget,
     QTableWidgetItem,
-    QTabWidget,
-    QVBoxLayout,
-    QWidget,
 )
 
 from streetjev.application.session import Session
 from streetjev.infrastructure.capture import ScreenCapture, list_windows, prepare_image
+from streetjev.infrastructure.chipoint import ChipointExpert
 from streetjev.infrastructure.demo import DemoExpert
 from streetjev.infrastructure.imajev import ImajevExpert
 from streetjev.infrastructure.storage import snapshot_json
 from streetjev.presentation.hotkeys import GlobalHotkeys, portable_text
 from streetjev.presentation.map_scale import format_score
-from streetjev.presentation.map_view import MapView, heat_color
+from streetjev.presentation.map_view import heat_color
 from streetjev.presentation.scores import display_scores
 from streetjev.presentation.selection import RegionOverlay
-from streetjev.presentation.worker import AnalysisWorker
+from streetjev.presentation.worker import AnalysisWorker, SupplementWorker
 
 log = logging.getLogger(__name__)
-
-
-def label(text, name=None):
-    item = QLabel(text)
-    if name:
-        item.setObjectName(name)
-    return item
 
 
 class MainWindow(QMainWindow):
     def __init__(self, catalog, geography, repository, data_dir: Path, demo=False):
         super().__init__()
         self.catalog, self.repository = catalog, repository
+        self.geography = geography
         self.session = Session(catalog, repository)
         self.settings = QSettings(str(data_dir / "settings.ini"), QSettings.Format.IniFormat)
         self.demo_expert = DemoExpert(catalog)
@@ -63,205 +41,27 @@ class MainWindow(QMainWindow):
         self.busy = False
         self.closing = False
         self.overlays = []
+        self.chip_busy = False
+        self.chip_generation = 0
+        self.pending_chip = {}
+        self.failed_frames = set()
+        self.primary_frame_id = None
         self.pool = QThreadPool(self)
         self.pool.setMaxThreadCount(1)
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.analyze)
         self.hotkeys = GlobalHotkeys(QApplication.instance())
         self.setWindowTitle("StreetJev · географические гипотезы")
-        self.resize(1380, 880)
-        self.setMinimumSize(1050, 720)
+        self.resize(1320, 820)
+        self.setMinimumSize(1000, 600)
         self.build_ui(geography, demo)
         self.update_snapshot()
         self.apply_hotkeys()
 
     def build_ui(self, geography, demo):
-        container = QWidget()
-        root = QVBoxLayout(container)
-        root.setContentsMargins(24, 18, 24, 18)
-        root.setSpacing(16)
-        header = QHBoxLayout()
-        titles = QVBoxLayout()
-        titles.addWidget(label("SCREEN → EVIDENCE → MAP", "eyebrow"))
-        titles.addWidget(label("StreetJev", "brand"))
-        header.addLayout(titles)
-        header.addStretch()
-        self.mode_badge = label("", "eyebrow")
-        header.addWidget(self.mode_badge)
-        self.frames_label = label("0 кадров", "metric")
-        header.addWidget(self.frames_label)
-        root.addLayout(header)
-        splitter = QSplitter(Qt.Orientation.Horizontal)
-        left = QWidget()
-        panel = QVBoxLayout(left)
-        panel.setContentsMargins(0, 0, 14, 0)
-        panel.setSpacing(12)
-        tabs = QTabWidget()
-        control = QWidget()
-        controls = QVBoxLayout(control)
-        controls.setContentsMargins(0, 12, 0, 0)
-        source = QGroupBox("Источник изображения")
-        source_layout = QVBoxLayout(source)
-        buttons = QHBoxLayout()
-        self.region_button = QPushButton("Выбрать область")
-        self.region_button.clicked.connect(self.choose_region)
-        self.window_button = QPushButton("Выбрать окно")
-        self.window_button.clicked.connect(self.choose_window)
-        buttons.addWidget(self.region_button)
-        buttons.addWidget(self.window_button)
-        source_layout.addLayout(buttons)
-        self.target_label = label("Область или окно ещё не выбраны", "muted")
-        self.target_label.setWordWrap(True)
-        source_layout.addWidget(self.target_label)
-        self.preview = label("Здесь появится последний кадр", "muted")
-        self.preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.preview.setMinimumHeight(90)
-        self.preview.setMaximumHeight(130)
-        source_layout.addWidget(self.preview)
-        controls.addWidget(source)
-        self.analyze_button = QPushButton("Анализировать кадр")
-        self.analyze_button.setObjectName("primary")
-        self.analyze_button.clicked.connect(self.analyze)
-        controls.addWidget(self.analyze_button)
-        self.file_button = QPushButton("Открыть изображение…")
-        self.file_button.clicked.connect(self.open_image)
-        controls.addWidget(self.file_button)
-        auto_row = QHBoxLayout()
-        self.auto = QCheckBox("Автозахват каждые")
-        self.auto.toggled.connect(self.toggle_timer)
-        auto_row.addWidget(self.auto)
-        self.interval = QSpinBox()
-        self.interval.setRange(1, 300)
-        self.interval.setValue(int(self.settings.value("interval", 5)))
-        self.interval.setSuffix(" с")
-        self.interval.valueChanged.connect(self.interval_changed)
-        auto_row.addWidget(self.interval)
-        controls.addLayout(auto_row)
-        self.reset_button = QPushButton("Новый раунд · сбросить знания")
-        self.reset_button.setObjectName("reset")
-        self.reset_button.clicked.connect(self.reset_round)
-        controls.addWidget(self.reset_button)
-        self.status = label("Выберите источник и сделайте первый кадр.", "status")
-        self.status.setWordWrap(True)
-        controls.addWidget(self.status)
-        self.effective = label("Вес учтённых кадров: 0.0", "muted")
-        controls.addWidget(self.effective)
-        self.uncertainty = label("Недостаточно данных: —", "muted")
-        controls.addWidget(self.uncertainty)
-        self.agreement = label("", "muted")
-        self.agreement.setWordWrap(True)
-        controls.addWidget(self.agreement)
-        controls.addStretch()
-        tabs.addTab(control, "Наблюдения")
-        config = QWidget()
-        form = QFormLayout(config)
-        self.demo = QCheckBox("Демонстрационные данные")
-        self.demo.setChecked(demo)
-        self.demo.toggled.connect(self.mode_changed)
-        form.addRow(self.demo)
-        self.url = QLineEdit(str(self.settings.value("url", "http://127.0.0.1:18765")))
-        self.url.editingFinished.connect(self.model_settings_changed)
-        form.addRow("Сервер imajev", self.url)
-        self.beam = QSpinBox()
-        self.beam.setRange(0, 5)
-        self.beam.setValue(int(self.settings.value("beam", 3)))
-        self.beam.setSpecialValueText("Только страны")
-        self.beam.valueChanged.connect(self.model_settings_changed)
-        form.addRow("Ветвей регионов", self.beam)
-        self.capture_key = QKeySequenceEdit(QKeySequence(str(self.settings.value("capture_key", "Ctrl+Alt+G"))))
-        self.reset_key = QKeySequenceEdit(QKeySequence(str(self.settings.value("reset_key", "Ctrl+Alt+R"))))
-        form.addRow("Снимок", self.capture_key)
-        form.addRow("Сброс", self.reset_key)
-        save_keys = QPushButton("Применить горячие клавиши")
-        save_keys.clicked.connect(self.apply_hotkeys)
-        form.addRow(save_keys)
-        hint = label(
-            "Модель запускается из этого репозитория:\nuv run python services/imajev/manage.py start\n\n"
-            "При смене модели или настроек начните новый раунд.\n"
-            "Проценты — оценки модели; географическая точность пока не откалибрована.",
-            "muted",
-        )
-        hint.setWordWrap(True)
-        form.addRow(hint)
-        tabs.addTab(config, "Настройки")
-        panel.addWidget(tabs)
-        self.ranking = QTableWidget(0, 3)
-        self.ranking.setHorizontalHeaderLabels(["Гипотеза", "Раунд", "Кадр"])
-        self.ranking.setToolTip(
-            "Раунд: взвешенное среднее. Кадр: исходная оценка модели на последнем снимке.\n"
-            "Для региона показана совместная оценка страны и региона; «—» означает нет данных."
-        )
-        self.ranking.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
-        self.ranking.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
-        self.ranking.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
-        self.ranking.verticalHeader().hide()
-        self.ranking.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
-        self.ranking.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
-        self.ranking.setMinimumHeight(190)
-        self.ranking.cellDoubleClicked.connect(self.focus_ranked)
-        panel.addWidget(self.ranking)
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setWidget(left)
-        scroll.setMinimumWidth(370)
-        splitter.addWidget(scroll)
-        right = QWidget()
-        map_layout = QVBoxLayout(right)
-        map_layout.setContentsMargins(0, 0, 0, 0)
-        map_toolbar = QHBoxLayout()
-        self.level = QComboBox()
-        self.level.addItems(["Страны", "Регионы"])
-        self.level.currentIndexChanged.connect(self.level_changed)
-        map_toolbar.addWidget(self.level)
-        map_toolbar.addStretch()
-        world = QPushButton("Весь мир")
-        world.clicked.connect(lambda: self.map.show_world())
-        map_toolbar.addWidget(world)
-        top = QPushButton("К лидеру")
-        top.clicked.connect(self.focus_leader)
-        map_toolbar.addWidget(top)
-        export = QPushButton("Экспорт JSON")
-        export.clicked.connect(self.export_snapshot)
-        map_toolbar.addWidget(export)
-        map_layout.addLayout(map_toolbar)
-        self.map = MapView(self.catalog, geography)
-        self.map.country_clicked.connect(lambda _: self.level.setCurrentIndex(1))
-        view_toolbar = QHBoxLayout()
-        self.score_source = QComboBox()
-        self.score_source.addItems(["Оценки раунда", "Последний кадр"])
-        self.score_source.currentIndexChanged.connect(self.display_changed)
-        view_toolbar.addWidget(self.score_source)
-        self.color_scale = QComboBox()
-        self.color_scale.addItems(["Относительная шкала · log", "Абсолютная шкала"])
-        self.color_scale.setCurrentIndex(int(self.settings.value("color_scale", 0)))
-        self.color_scale.currentIndexChanged.connect(self.display_changed)
-        view_toolbar.addWidget(self.color_scale)
-        view_toolbar.addStretch()
-        map_layout.addLayout(view_toolbar)
-        map_layout.addWidget(self.map, 1)
-        self.scale_caption = label("", "muted")
-        self.scale_caption.setWordWrap(True)
-        map_layout.addWidget(self.scale_caption)
-        legend = QHBoxLayout()
-        self.legend_labels = []
-        for _ in range(6):
-            dot = label("")
-            self.legend_labels.append(dot)
-            legend.addWidget(dot)
-        map_layout.addLayout(legend)
-        self.map.scale_changed.connect(self.update_legend)
-        map_layout.addWidget(
-            label("Колесо — масштаб · перетаскивание — перемещение · двойной щелчок — регионы страны", "muted")
-        )
-        map_layout.addWidget(
-            label("Серый — нет данных или нижняя граница шкалы · оценки не откалиброваны · Natural Earth", "muted")
-        )
-        splitter.addWidget(right)
-        splitter.setSizes([410, 920])
-        root.addWidget(splitter, 1)
-        self.setCentralWidget(container)
-        self.set_mode_ui()
-        self._model_settings = (self.url.text().strip(), self.beam.value())
+        from streetjev.presentation.layout import build_window
+
+        build_window(self, geography, demo)
 
     def model_settings_changed(self):
         current = (self.url.text().strip(), self.beam.value())
@@ -272,16 +72,18 @@ class MainWindow(QMainWindow):
 
     def set_mode_ui(self):
         demo = self.demo.isChecked()
-        self.mode_badge.setText("ДЕМО · СИНТЕТИЧЕСКИЕ ДАННЫЕ" if demo else "IMAJEV · ЛОКАЛЬНЫЙ СЕРВЕР")
+        self.mode_badge.setText("Демо" if demo else "imajev")
         self.region_button.setEnabled(not demo and not self.busy)
         self.window_button.setEnabled(not demo and not self.busy)
         self.file_button.setEnabled(not demo and not self.busy)
         self.url.setEnabled(not demo and not self.busy)
         self.beam.setEnabled(not demo and not self.busy)
-        self.analyze_button.setText("Добавить демо-наблюдение" if demo else "Анализировать кадр")
+        self.analyze_button.setText("Демо-кадр" if demo else "Снимок")
+        self.chip_enabled.setEnabled(not demo)
 
     def mode_changed(self):
         self.auto.setChecked(False)
+        self.chip_enabled.setChecked(False)
         self.reset_round()
         self.set_mode_ui()
 
@@ -355,8 +157,9 @@ class MainWindow(QMainWindow):
     def set_target(self, target):
         self.target = target
         self.target_label.setText(target.name)
+        self.target_label.setToolTip(target.name)
         self.reset_round()
-        self.status.setText("Источник выбран. Нажмите «Анализировать кадр» или горячую клавишу.")
+        self.status.setText("Источник выбран")
 
     def open_image(self):
         path, _ = QFileDialog.getOpenFileName(
@@ -397,9 +200,10 @@ class MainWindow(QMainWindow):
         self.analyze_button.setEnabled(False)
         self.demo.setEnabled(False)
         self.set_mode_ui()
-        self.status.setText("Снимаю кадр и проверяю географические признаки…")
+        self.status.setText("imajev: анализ…")
         worker = AnalysisWorker(self.session.round, capture, expert)
         worker.signals.captured.connect(lambda frame, rid=self.session.round.id: self.show_frame(rid, frame))
+        worker.signals.eligible.connect(self.start_chipoint)
         worker.signals.completed.connect(self.analysis_complete)
         worker.signals.failed.connect(self.analysis_failed)
         worker.signals.finished.connect(self.analysis_finished)
@@ -410,36 +214,44 @@ class MainWindow(QMainWindow):
         if round_id != self.session.round.id:
             return
         if frame.jpeg:
+            self.preview.show()
+            self.sidebar.show()
             pixmap = QPixmap()
             pixmap.loadFromData(frame.jpeg, "JPEG")
             self.preview.setPixmap(
                 pixmap.scaled(
-                    310, 150, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation
+                    self.preview.width(),
+                    110,
+                    Qt.AspectRatioMode.KeepAspectRatio,
+                    Qt.TransformationMode.SmoothTransformation,
                 )
             )
         else:
-            self.preview.setText("Демо: кадр не снимается и не анализируется")
+            self.preview.hide()
+        self.fit_side_panel()
 
     def analysis_complete(self, result):
         if result.round_id != self.session.round.id:
-            self.status.setText("Ответ предыдущего раунда отброшен. Новый раунд готов.")
             return
         if result.evidence is None:
-            self.status.setText("Кадр почти не изменился — повторное наблюдение пропущено.")
+            self.status.setText("Повторный кадр пропущен")
             return
         try:
             if self.session.accept(result):
+                pending = self.pending_chip.pop(result.frame.id, None)
+                if pending and self.chip_enabled.isChecked():
+                    self.accept_chipoint(pending)
                 self.update_snapshot()
-                self.status.setText(
-                    f"Наблюдение добавлено · {result.evidence.elapsed_ms / 1000:.2f} с\n"
-                    f"Вес новизны: {result.novelty:.2f}"
-                )
+                self.status.setText(f"imajev · {result.evidence.elapsed_ms / 1000:.1f} с")
         except Exception as exc:
             log.exception("Не удалось сохранить наблюдение")
             self.analysis_failed(result.round_id, str(exc))
 
     def analysis_failed(self, round_id, message):
         if round_id == self.session.round.id:
+            if self.primary_frame_id:
+                self.failed_frames.add(self.primary_frame_id)
+                self.pending_chip.pop(self.primary_frame_id, None)
             self.auto.setChecked(False)
             self.status.setText(message)
             log.error("Ошибка анализа: %s", message)
@@ -460,16 +272,25 @@ class MainWindow(QMainWindow):
             self.status.setText(f"Не удалось создать раунд: {exc}")
             return
         self.demo_expert = DemoExpert(self.catalog)
+        self.chip_generation += 1
+        self.pending_chip.clear()
+        self.failed_frames.clear()
+        self.chip_status.setText(
+            "завершается…" if self.chip_busy else "готов" if self.chip_enabled.isChecked() else "выкл."
+        )
         self.preview.clear()
-        self.preview.setText("Новый раунд · пока нет кадров")
+        self.preview.hide()
+        self.auto_focus.setChecked(True)
         self.update_snapshot()
-        self.status.setText("Знания сброшены. Следующий кадр начнёт новый раунд.")
+        self.status.setText("Новый раунд")
 
     def update_snapshot(self):
         snapshot = self.session.round.snapshot()
         self.map.source = "last" if self.score_source.currentIndex() else "round"
         self.map.scale_mode = "absolute" if self.color_scale.currentIndex() else "relative"
         self.map.update_snapshot(snapshot)
+        if self.auto_focus.isChecked():
+            self.map.focus_hypotheses(snapshot)
         self.frames_label.setText(f"{snapshot.frames} кадров")
         self.effective.setText(f"Вес учтённых кадров: {snapshot.effective_frames:.2f}")
         self.uncertainty.setText(
@@ -477,15 +298,13 @@ class MainWindow(QMainWindow):
             if snapshot.frames
             else "«Не знаю» у модели на кадре: —"
         )
-        if snapshot.known_frames == 0:
-            self.agreement.setText("Пока нет географических наблюдений.")
-        elif snapshot.known_frames == 1:
-            self.agreement.setText("Один кадр. Проверки другими ракурсами пока нет.")
-        else:
-            self.agreement.setText(
-                f"Лидер раунда был первым в {snapshot.agreeing_frames} из "
-                f"{snapshot.known_frames} кадров. Совпадение не гарантирует правильность."
-            )
+        self.agreement.setText(
+            f"Согласие {snapshot.agreeing_frames}/{snapshot.known_frames}" if snapshot.known_frames else ""
+        )
+        self.frames_label.setToolTip(self.effective.text() + "\n" + self.uncertainty.text())
+        self.agreement.setToolTip(
+            "В скольких кадрах лидер раунда был первым. Это не вероятность правильного ответа."
+        )
         selected = display_scores(snapshot, self.map.source)
         regional = self.level.currentIndex() == 1
         places = self.catalog.regions if regional else self.catalog.countries
@@ -494,8 +313,12 @@ class MainWindow(QMainWindow):
             probabilities = {
                 k: p for k, p in probabilities.items() if places[k].country_code in selected.observed_regions
             }
-        ranked = sorted(probabilities.items(), key=lambda pair: pair[1], reverse=True)[:8]
+        ranked = sorted(probabilities.items(), key=lambda pair: pair[1], reverse=True)[:12]
+        if ranked:
+            ranked = [item for index, item in enumerate(ranked) if index < 3 or item[1] >= ranked[0][1] * 0.01]
         self.ranking.setRowCount(len(ranked) if selected.active else 0)
+        self.sidebar.setVisible(selected.active or not self.preview.isHidden())
+        self.fit_side_panel()
         if selected.active:
             for row, (key, _probability) in enumerate(ranked):
                 name = places[key].label
@@ -525,20 +348,20 @@ class MainWindow(QMainWindow):
                 foreground = "#102920" if intensity >= 0.4 else "#dce7ef"
                 dot.setStyleSheet(
                     f"background: {heat_color(intensity).name()}; color: {foreground}; "
-                    "border-radius: 4px; padding: 5px;"
+                    "border-radius: 3px; padding: 3px;"
                 )
         if scale.empty:
-            message = "Для этого слоя ещё нет оценок."
+            message = "Нет оценок"
         elif scale.flat:
-            message = "Оценки равны — цветом нечего выделить."
+            message = "Равные оценки"
         elif scale.mode == "relative":
-            message = (
-                f"Относительный контраст · максимум слоя {format_score(scale.maximum)}. "
-                "В легенде реальные оценки, яркость не означает достоверность."
-            )
+            message = f"Макс. {format_score(scale.maximum)}"
         else:
-            message = "Абсолютная шкала оценок 0–100%. Оценка модели не равна вероятности правильного ответа."
+            message = "Абсолютная"
         self.scale_caption.setText(message)
+        self.scale_caption.setToolTip(
+            "В легенде реальные оценки; яркость не означает достоверность. Серый — нет данных или нижняя граница шкалы."
+        )
 
     def level_changed(self):
         if hasattr(self, "map"):
@@ -546,11 +369,13 @@ class MainWindow(QMainWindow):
             self.update_snapshot()
 
     def focus_leader(self):
+        self.auto_focus.setChecked(False)
         scores = display_scores(self.session.round.snapshot(), self.map.source)
         if scores.active:
             self.map.focus_country(max(scores.countries, key=scores.countries.get))
 
     def focus_ranked(self, row, column):
+        self.auto_focus.setChecked(False)
         item = self.ranking.item(row, 0)
         if item:
             self.map.focus_country(item.data(Qt.ItemDataRole.UserRole))
@@ -563,7 +388,9 @@ class MainWindow(QMainWindow):
                     (portable_text(self.reset_key), self.reset_round),
                 ]
             )
-            self.status.setText("Горячие клавиши действуют и при работе в другом окне.")
+            self.status.setText("Готово")
+            self.analyze_button.setToolTip("Снимок · " + portable_text(self.capture_key))
+            self.reset_button.setToolTip("Новый раунд · " + portable_text(self.reset_key))
         except (ValueError, RuntimeError) as exc:
             self.status.setText(str(exc))
 
@@ -574,6 +401,8 @@ class MainWindow(QMainWindow):
                 data = json.loads(snapshot_json(self.session.round.snapshot()))
                 data["mode"] = "demo" if self.demo.isChecked() else "imajev"
                 data["calibrated_for_geography"] = False
+                data["chipoint_enabled"] = self.chip_enabled.isChecked()
+                data["fusion"] = "linear_experts_v1" if self.chip_enabled.isChecked() else None
                 Path(path).write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
                 self.status.setText("Текущее распределение экспортировано.")
             except OSError as exc:
@@ -588,6 +417,8 @@ class MainWindow(QMainWindow):
             event.ignore()
             return
         self.hotkeys.close()
+        self.closing = True
+        self.chip_generation += 1
         for name, value in {
             "url": self.url.text(),
             "beam": self.beam.value(),
@@ -595,8 +426,116 @@ class MainWindow(QMainWindow):
             "capture_key": portable_text(self.capture_key),
             "reset_key": portable_text(self.reset_key),
             "color_scale": self.color_scale.currentIndex(),
+            "chip_enabled": self.chip_enabled.isChecked(),
+            "chip_url": self.chip_url.text(),
+            "chip_timeout": self.chip_timeout.value(),
         }.items():
             self.settings.setValue(name, value)
         self.settings.sync()
         self.repository.close()
         event.accept()
+
+    def show_settings(self):
+        self.settings_dialog.show()
+        self.settings_dialog.raise_()
+
+    def show_world(self):
+        self.auto_focus.setChecked(False)
+        self.map.show_world()
+
+    def auto_focus_changed(self, enabled):
+        if enabled:
+            self.map.focus_hypotheses(self.session.round.snapshot())
+
+    def chipoint_changed(self, enabled):
+        self.chip_generation += 1
+        self.pending_chip.clear()
+        if not enabled:
+            try:
+                self.session.clear_supplements()
+                self.update_snapshot()
+            except Exception as exc:
+                log.exception("Не удалось отключить Chipoint")
+                self.chip_enabled.blockSignals(True)
+                self.chip_enabled.setChecked(True)
+                self.chip_enabled.blockSignals(False)
+                self.status.setText(f"Не удалось отключить Chipoint: {exc}")
+                return
+        self.chip_status.setText("готов" if enabled else "выкл.")
+
+    def start_chipoint(self, request):
+        self.primary_frame_id = request.frame.id
+        if (
+            request.round_id != self.session.round.id
+            or not self.chip_enabled.isChecked()
+            or self.demo.isChecked()
+            or self.closing
+        ):
+            return
+        if self.chip_busy:
+            self.chip_status.setToolTip("Предыдущий запрос ещё выполняется; новый кадр обрабатывает только imajev")
+            return
+        try:
+            expert = ChipointExpert(
+                self.catalog, self.geography, self.chip_url.text().strip(), self.chip_timeout.value()
+            )
+        except ValueError as exc:
+            self.chip_status.setText("ошибка адреса")
+            self.chip_status.setToolTip(str(exc))
+            return
+        generation = self.chip_generation
+        self.chip_busy = True
+        self.chip_status.setText("поиск…")
+        self.chip_status.setToolTip("Поиск Chipoint. imajev продолжает работать независимо.")
+        worker = SupplementWorker(request, expert)
+        worker.signals.completed.connect(lambda result: self.chipoint_complete(generation, result))
+        worker.signals.failed.connect(lambda rid, message: self.chipoint_failed(generation, rid, message))
+        worker.signals.finished.connect(self.chipoint_finished)
+        self.chip_worker = worker
+        worker.start()
+
+    def chipoint_complete(self, generation, result):
+        if self.closing or generation != self.chip_generation or result.round_id != self.session.round.id:
+            return
+        if result.frame.id in self.failed_frames:
+            return
+        if self.session.has_frame(result.frame.id):
+            self.accept_chipoint(result)
+        else:
+            self.pending_chip[result.frame.id] = result
+            self.chip_status.setText("ждёт imajev")
+
+    def accept_chipoint(self, result):
+        try:
+            if self.session.supplement(result):
+                self.chip_status.setText(f"{result.evidence.elapsed_ms / 1000:.1f} с")
+                self.chip_status.setToolTip("Кадр дополнен Chipoint Street Retrieval; вес 35%, без reranker")
+                self.update_snapshot()
+        except Exception as exc:
+            self.chip_status.setText("ошибка сохранения")
+            self.chip_status.setToolTip(str(exc))
+            log.exception("Ошибка сохранения Chipoint")
+
+    def chipoint_failed(self, generation, round_id, message):
+        if not self.closing and generation == self.chip_generation and round_id == self.session.round.id:
+            self.chip_status.setText("недоступен")
+            self.chip_status.setToolTip(
+                message + "\nimajev продолжает работу. Запуск: services/chipoint/manage.py start"
+            )
+            log.warning("%s", message)
+
+    def chipoint_finished(self):
+        self.chip_busy = False
+        if not self.closing and self.chip_status.text() == "завершается…":
+            self.chip_status.setText("готов" if self.chip_enabled.isChecked() else "выкл.")
+
+    def fit_side_panel(self):
+        needed = self.ranking.horizontalHeader().height() + 28 * self.ranking.rowCount() + 2
+        room = self.height() - 165 - (115 if not self.preview.isHidden() else 0)
+        self.ranking.setFixedHeight(max(60, min(needed, room)))
+        self.sidebar.setFixedHeight(self.ranking.height() + 34 + (115 if not self.preview.isHidden() else 0))
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        if hasattr(self, "ranking"):
+            self.fit_side_panel()

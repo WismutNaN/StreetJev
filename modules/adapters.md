@@ -1,6 +1,6 @@
 # Модуль: внешние адаптеры
 
-Расположение: `src/streetjev/infrastructure/`, `services/imajev/`.
+Расположение: `src/streetjev/infrastructure/`, `services/imajev/`, `services/chipoint/`.
 Отвечает за преобразование внешних данных в значения домена.
 
 Публичные реализации: `ImajevExpert`, `DemoExpert`, `ScreenCapture`, `SqliteRoundRepository`,
@@ -13,3 +13,10 @@ imajev принимает multipart JPEG и JSON, возвращает полн�
 SQLite сохраняет raw response, нормализованный evidence и snapshot в одной транзакции.
 Изображения не сохраняются. Геоданные поставляются с пакетом, сетевой доступ карте не нужен.
 Адаптеры не меняют GUI и не принимают решение о сбросе раунда.
+
+`ChipointExpert` принимает top-64 координат/score от локального сервиса, проверяет контракт,
+сопоставляет точки через `GeographicLocator` (Shapely STRtree) и передаёт country/admin1
+распределения. Непокрытая полигоном масса становится unknown. Полный список кандидатов
+остаётся в raw JSON таблицы `supplementary_observations`, отдельно от ответа imajev.
+Сервис использует закреплённые веса и не загружает файлы во время inference.
+Подробнее: [Chipoint](../services/chipoint/README.md).

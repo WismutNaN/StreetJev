@@ -386,6 +386,7 @@ dependencies = [
     { name = "mss" },
     { name = "pillow" },
     { name = "pyside6" },
+    { name = "shapely" },
 ]
 
 [package.dev-dependencies]
@@ -401,6 +402,7 @@ requires-dist = [
     { name = "mss", specifier = ">=10,<11" },
     { name = "pillow", specifier = ">=11,<13" },
     { name = "pyside6", specifier = ">=6.8,<7" },
+    { name = "shapely", specifier = ">=2,<3" },
 ]
 
 [package.metadata.requires-dev]

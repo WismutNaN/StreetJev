@@ -7,6 +7,7 @@ from PySide6.QtWidgets import QGraphicsPathItem, QGraphicsScene, QGraphicsView
 
 from streetjev.domain.geography import GeoCatalog
 from streetjev.domain.round import RoundSnapshot
+from streetjev.presentation.auto_focus import Bounds, focus_bounds
 from streetjev.presentation.map_scale import HeatScale, format_score
 from streetjev.presentation.scores import display_scores
 
@@ -36,6 +37,7 @@ def heat_color(intensity):
 class MapView(QGraphicsView):
     country_clicked = Signal(str)
     scale_changed = Signal(object)
+    manual_navigation = Signal()
 
     def __init__(self, catalog: GeoCatalog, geography: dict):
         super().__init__()
@@ -104,12 +106,14 @@ class MapView(QGraphicsView):
             self.show_world()
 
     def wheelEvent(self, event):
+        self.manual_navigation.emit()
         self.auto_fit = False
         factor = 1.2 if event.angleDelta().y() > 0 else 1 / 1.2
         if 0.7 < self.transform().m11() * factor < 700:
             self.scale(factor, factor)
 
     def mouseDoubleClickEvent(self, event):
+        self.manual_navigation.emit()
         item = self.itemAt(event.position().toPoint())
         if item:
             code = item.data(1) or item.data(0)
@@ -117,6 +121,46 @@ class MapView(QGraphicsView):
             self.focus_country(code)
         else:
             self.show_world()
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.manual_navigation.emit()
+        super().mousePressEvent(event)
+
+    def focus_hypotheses(self, snapshot):
+        scores = display_scores(snapshot, self.source)
+        values = scores.countries
+        boxes = self.country_bounds
+        if self.level == "regions" and scores.observed_regions:
+            values = {
+                code: value
+                for code, value in scores.regions.items()
+                if self.catalog.regions[code].country_code in scores.observed_regions
+            }
+            boxes = {code: self.items_by_code[code].boundingRect() for code in values}
+            # Нельзя кадрировать по регионам, если ведущие страны ещё не исследованы.
+            covered = sum(scores.countries[c] for c in scores.observed_regions)
+            if covered < 0.55:
+                values, boxes = scores.countries, self.country_bounds
+        target = (
+            focus_bounds(
+                values,
+                {
+                    code: Bounds(rect.left(), rect.top(), rect.right(), rect.bottom())
+                    for code, rect in boxes.items()
+                },
+            )
+            if scores.active
+            else None
+        )
+        if target is None:
+            self.show_world()
+        else:
+            self.auto_fit = False
+            self.fitInView(
+                QRectF(target.left, target.top, target.right - target.left, target.bottom - target.top),
+                Qt.AspectRatioMode.KeepAspectRatio,
+            )
 
     def set_level(self, level):
         self.level = level
