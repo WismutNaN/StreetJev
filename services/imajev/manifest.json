@@ -1,0 +1,13 @@
+{
+  "source_repository": "https://github.com/mohit67890/imajev",
+  "source_revision": "7a0e6a11eab8f38e6c005c7137d7ae47f7339613",
+  "base_model": "Qwen/Qwen3.5-4B",
+  "base_revision": "851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a",
+  "adapter": "mohit67890/imajev-4b",
+  "adapter_revision": "f8d8234cebc6c99065c07731e59716dc0a6e27ab",
+  "backend": "torch",
+  "cuda_wheels": "cu128",
+  "rotations": 1,
+  "host": "127.0.0.1",
+  "port": 18765
+}
