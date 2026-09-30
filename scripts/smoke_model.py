@@ -1,5 +1,6 @@
 """Интеграционная проверка GPU на синтетическом изображении; не benchmark точности."""
 
+import argparse
 import json
 import time
 from pathlib import Path
@@ -10,18 +11,23 @@ from PIL import Image, ImageDraw, ImageFont
 from streetjev.application.session import AnalysisResult, Session
 from streetjev.infrastructure.capture import prepare_image
 from streetjev.infrastructure.catalog import load_geography
+from streetjev.infrastructure.clues import load_clue_facts
 from streetjev.infrastructure.imajev import ImajevExpert
 from streetjev.infrastructure.storage import SqliteRoundRepository
 
 
 def main():
-    output = Path("artifacts/model")
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--url", default="http://127.0.0.1:18765")
+    parser.add_argument("--output", type=Path, default=Path("artifacts/model"))
+    args = parser.parse_args()
+    output = args.output
     output.mkdir(parents=True, exist_ok=True)
     with httpx.Client(timeout=3, trust_env=False) as client:
         deadline = time.monotonic() + 180
         while True:
             try:
-                response = client.get("http://127.0.0.1:18765/v1/models")
+                response = client.get(args.url.rstrip("/") + "/v1/models")
                 response.raise_for_status()
                 print("Сервис готов:", response.json(), flush=True)
                 break
@@ -41,13 +47,14 @@ def main():
     draw.text((355, 180), "A12  INNSBRUCK", font=font, fill="white")
     draw.text((355, 210), "SALZBURG  150 km", font=font, fill="white")
     image.save(output / "synthetic-road.png")
-    catalog, _ = load_geography()
-    expert = ImajevExpert(catalog, timeout=180, beam=3)
+    catalog, geography = load_geography()
+    expert = ImajevExpert(catalog, args.url, timeout=180, beam=3, facts=load_clue_facts(geography))
     frame = prepare_image(image, "Синтетический тест интеграции")
     evidence = expert.infer(frame)
     assert evidence.model_version == "imajev-4b"
     assert len(evidence.countries.probabilities) == len(catalog.countries)
     assert abs(sum(evidence.countries.probabilities.values()) - 1) < 1e-8
+    assert set(evidence.clues) == {"hemisphere", "driving_side"}
     repo = SqliteRoundRepository(output / "smoke.sqlite3")
     try:
         session = Session(catalog, repo)
@@ -62,6 +69,10 @@ def main():
             "region_branches": list(evidence.regions),
             "unknown": evidence.countries.unknown,
             "top": top,
+            "clues": {
+                key: {"probabilities": dict(value.probabilities), "unknown": value.unknown}
+                for key, value in evidence.clues.items()
+            },
         }
         (output / "report.json").write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
         (output / "raw-response.json").write_text(evidence.raw_json, encoding="utf-8")

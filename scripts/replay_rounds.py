@@ -7,6 +7,7 @@ from pathlib import Path
 
 from streetjev.domain.evidence import Distribution, Frame, GeoEvidence
 from streetjev.domain.fusion import fuse_evidence
+from streetjev.domain.localization import LocalCell
 from streetjev.domain.round import GeoRound
 from streetjev.infrastructure.catalog import load_geography
 
@@ -41,6 +42,7 @@ def replay(database: Path, imajev_only=False) -> list[dict]:
                     },
                     raw,
                     elapsed_ms,
+                    cells=tuple(LocalCell(**cell) for cell in data.get("cells", [])),
                 )
                 if has_supplements and not imajev_only:
                     row = connection.execute(
@@ -61,6 +63,7 @@ def replay(database: Path, imajev_only=False) -> list[dict]:
                             },
                             raw2,
                             elapsed2,
+                            cells=tuple(LocalCell(**cell) for cell in data2.get("cells", [])),
                         )
                         evidence = fuse_evidence(evidence, other, weight2)
                 # Изображения не сохранены: используем записанный вес, novelty повторно не вычисляем.

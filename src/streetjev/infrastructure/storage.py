@@ -5,6 +5,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from streetjev.domain.evidence import Frame, GeoEvidence
+from streetjev.domain.ground_truth import GroundTruth
 from streetjev.domain.round import RoundSnapshot
 
 
@@ -24,6 +25,11 @@ def evidence_json(evidence: GeoEvidence) -> str:
                 k: {"probabilities": dict(v.probabilities), "unknown": v.unknown}
                 for k, v in evidence.regions.items()
             },
+            "clues": {
+                k: {"probabilities": dict(v.probabilities), "unknown": v.unknown}
+                for k, v in evidence.clues.items()
+            },
+            "cells": [asdict(cell) for cell in evidence.cells],
         },
         ensure_ascii=False,
     )
@@ -52,6 +58,12 @@ class SqliteRoundRepository:
                 raw_json TEXT NOT NULL, weight REAL NOT NULL, active INTEGER NOT NULL DEFAULT 1,
                 PRIMARY KEY (frame_id, expert)
             );
+            CREATE TABLE IF NOT EXISTS ground_truth (
+                round_id TEXT PRIMARY KEY REFERENCES rounds(id),
+                latitude REAL NOT NULL, longitude REAL NOT NULL,
+                country TEXT NOT NULL, region TEXT,
+                created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+            );
         """)
 
     def start(self, snapshot: RoundSnapshot) -> None:
@@ -62,14 +74,6 @@ class SqliteRoundRepository:
             )
 
     def append(self, snapshot: RoundSnapshot, frame: Frame, evidence: GeoEvidence, novelty: float) -> None:
-        data = {
-            "countries": dict(evidence.countries.probabilities),
-            "unknown": evidence.countries.unknown,
-            "regions": {
-                k: {"probabilities": dict(v.probabilities), "unknown": v.unknown}
-                for k, v in evidence.regions.items()
-            },
-        }
         with self.connection:
             self.connection.execute(
                 "INSERT INTO observations VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
@@ -82,7 +86,7 @@ class SqliteRoundRepository:
                     evidence.model_version,
                     novelty,
                     evidence.elapsed_ms,
-                    json.dumps(data, ensure_ascii=False),
+                    evidence_json(evidence),
                     evidence.raw_json,
                 ),
             )
@@ -92,6 +96,26 @@ class SqliteRoundRepository:
 
     def close(self):
         self.connection.close()
+
+    def label(self, round_id: str, truth: GroundTruth) -> None:
+        now = datetime.now(UTC).isoformat()
+        with self.connection:
+            self.connection.execute(
+                "INSERT INTO ground_truth VALUES (?, ?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT(round_id) DO UPDATE SET latitude=excluded.latitude, longitude=excluded.longitude, "
+                "country=excluded.country, region=excluded.region, updated_at=excluded.updated_at",
+                (round_id, truth.latitude, truth.longitude, truth.country, truth.region, now, now),
+            )
+
+    def refine(self, snapshot: RoundSnapshot, frame: Frame, evidence: GeoEvidence) -> None:
+        with self.connection:
+            self.connection.execute(
+                "UPDATE observations SET evidence=?, raw_json=?, elapsed_ms=? WHERE frame_id=? AND round_id=?",
+                (evidence_json(evidence), evidence.raw_json, evidence.elapsed_ms, frame.id, snapshot.id),
+            )
+            self.connection.execute(
+                "UPDATE rounds SET snapshot=? WHERE id=?", (snapshot_json(snapshot), snapshot.id)
+            )
 
     def supplement(self, snapshot: RoundSnapshot, frame: Frame, evidence: GeoEvidence, weight: float) -> None:
         with self.connection:

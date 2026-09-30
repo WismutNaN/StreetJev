@@ -45,8 +45,8 @@ class AnalysisWorker(QRunnable):
 class SupplementWorker:
     """Один необязательный HTTP-запрос; не удерживает GUI при закрытии."""
 
-    def __init__(self, request: AnalysisResult, expert: GeoExpert):
-        self.request, self.expert = request, expert
+    def __init__(self, request: AnalysisResult, operation):
+        self.request, self.operation = request, operation
         self.signals = WorkerSignals()
 
     def start(self):
@@ -55,7 +55,7 @@ class SupplementWorker:
     def run(self):
         try:
             item = self.request
-            evidence = self.expert.infer(item.frame)
+            evidence = self.operation(item.frame)
             self.signals.completed.emit(AnalysisResult(item.round_id, item.frame, evidence, item.novelty))
         except Exception as exc:
             log.exception("Необязательный эксперт не завершил запрос")

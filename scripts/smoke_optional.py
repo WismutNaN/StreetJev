@@ -37,14 +37,17 @@ def main():
         return GeoEvidence("imajev", "test", Distribution(values), {}, "{}", 15)
 
     class Primary:
-        def __init__(self, *args):
+        def __init__(self, *args, **kwargs):
             pass
 
         def infer(self, frame):
             return evidence("AT")
 
+        def missing_regions(self, primary, secondary):
+            return []
+
     class Slow:
-        def __init__(self, *args):
+        def __init__(self, *args, **kwargs):
             pass
 
         def infer(self, frame):
@@ -56,6 +59,7 @@ def main():
     ui.ImajevExpert, ui.ChipointExpert = Primary, Slow
     repo = SqliteRoundRepository(output / "smoke.sqlite3")
     window = ui.MainWindow(catalog, geography, repo, output, demo=False)
+    window.details.setChecked(False)
     window.show()
     window.chip_enabled.setChecked(True)
 
@@ -129,7 +133,7 @@ def main():
 
     # Ошибка Chipoint не останавливает таймер или приём imajev.
     class Broken:
-        def __init__(self, *args):
+        def __init__(self, *args, **kwargs):
             pass
 
         def infer(self, frame):
@@ -140,10 +144,51 @@ def main():
     pump(lambda: not window.busy and not window.chip_busy)
     assert window.session.round.frames == 1
     assert window.chip_status.text() == "недоступен"
+
+    # После обоих ответов дополнительный регион приходит в тот же кадр.
+    refine_release = threading.Event()
+
+    class Refining(Primary):
+        def missing_regions(self, primary, secondary):
+            return ["DE"] if "DE" not in primary.regions else []
+
+        def refine(self, frame, primary, secondary):
+            assert refine_release.wait(5)
+            regions = Distribution({p.code: 1 for p in catalog.regions_of("DE")})
+            return replace(primary, regions={"DE": regions}, raw_json='{"chipoint_region_refinement": {}}')
+
+    ui.ImajevExpert, ui.ChipointExpert = Refining, Slow
+    window.reset_round()
+    window.start_analysis(capture(30))
+    pump(lambda: not window.busy and window.refinement_busy)
+    assert window.session.round.frames == 1
+    assert "DE" not in window.session.round.observed_regions
+    refine_release.set()
+    pump(lambda: not window.refinement_busy and not window.chip_busy)
+    assert window.session.round.frames == 1
+    assert "DE" in window.session.round.observed_regions
+    assert window.chip_status.text() == "уточнён"
+
+    # Уточнение, пришедшее после отключения или сброса, не применяется.
+    for reset in (False, True):
+        window.chip_enabled.setChecked(True)
+        window.reset_round()
+        refine_release.clear()
+        window.start_analysis(capture(60))
+        pump(lambda: not window.busy and window.refinement_busy)
+        if reset:
+            window.reset_round()
+        else:
+            window.chip_enabled.setChecked(False)
+        refine_release.set()
+        pump(lambda: not window.refinement_busy and not window.chip_busy)
+        assert "DE" not in window.session.round.observed_regions
+        assert window.session.round.frames == (0 if reset else 1)
+
     window.chip_enabled.setChecked(False)
     window.close()
     app.processEvents()
-    print("Optional smoke: медленный ответ, нет очереди, disable, reset, timeout — OK")
+    print("Optional smoke: медленный ответ, нет очереди, disable, reset, timeout, уточнение регионов — OK")
 
 
 if __name__ == "__main__":

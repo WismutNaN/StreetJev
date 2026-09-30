@@ -1,10 +1,11 @@
 import math
 from copy import copy
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from uuid import uuid4
 
 from streetjev.domain.evidence import Distribution, Frame, GeoEvidence
 from streetjev.domain.geography import GeoCatalog
+from streetjev.domain.localization import LocalCell, combine_cells, local_scores
 
 AGGREGATION_VERSION = "weighted_linear_v2"
 
@@ -41,6 +42,8 @@ class RoundSnapshot:
     last_observed_regions: frozenset[str] = frozenset()
     known_frames: int = 0
     agreeing_frames: int = 0
+    cells: tuple[LocalCell, ...] = ()
+    last_cells: tuple[LocalCell, ...] = ()
 
 
 class GeoRound:
@@ -66,6 +69,8 @@ class GeoRound:
         self._seen_ids: set[str] = set()
         self._fingerprints: list[bytes] = []
         self._seen_fingerprints: set[bytes] = set()
+        self._cells: tuple[LocalCell, ...] = ()
+        self._local_weight = 0.0
 
     def novelty(self, frame: Frame) -> float:
         if not frame.fingerprint or frame.fingerprint in self._seen_fingerprints:
@@ -104,6 +109,18 @@ class GeoRound:
             region_weights[country] += weight * (1 - distribution.unknown)
             if weight * (1 - distribution.unknown) > 0:
                 observed.add(country)
+        for cell in evidence.cells:
+            if cell.country not in self.catalog.countries or (
+                cell.region
+                and (
+                    cell.region not in self.catalog.regions
+                    or self.catalog.regions[cell.region].country_code != cell.country
+                )
+            ):
+                raise ValueError("Неизвестный родитель локальной зоны")
+        cells = combine_cells((*self._cells, *(replace(c, mass=c.mass * novelty) for c in evidence.cells)))
+        self._cells = cells
+        self._local_weight += novelty
         self.countries = countries
         self.region_conditionals = conditionals
         self.observed_regions = observed
@@ -134,26 +151,30 @@ class GeoRound:
 
     def snapshot(self) -> RoundSnapshot:
         last = self._last_evidence
-        return RoundSnapshot(
-            self.id,
-            self.frames,
-            self.effective_frames,
-            self.countries.copy(),
+        regions = {
+            region: self.countries[country] * probability
+            for country, values in self.region_conditionals.items()
+            for region, probability in values.items()
+        }
+        last_regions = (
             {
-                region: self.countries[country] * probability
-                for country, regions in self.region_conditionals.items()
-                for region, probability in regions.items()
-            },
-            frozenset(self.observed_regions),
-            self.last_unknown,
-            last_countries=dict(last.countries.probabilities) if last else {},
-            last_regions={
                 region: last.countries.probabilities[country] * probability
                 for country, distribution in last.regions.items()
                 for region, probability in distribution.probabilities.items()
             }
             if last
-            else {},
+            else {}
+        )
+        return RoundSnapshot(
+            self.id,
+            self.frames,
+            self.effective_frames,
+            self.countries.copy(),
+            regions,
+            frozenset(self.observed_regions),
+            self.last_unknown,
+            last_countries=dict(last.countries.probabilities) if last else {},
+            last_regions=last_regions,
             last_observed_regions=frozenset(
                 country
                 for country, distribution in last.regions.items()
@@ -165,4 +186,6 @@ class GeoRound:
             agreeing_frames=self._leader_votes[max(self.countries, key=self.countries.get)]
             if self.known_frames
             else 0,
+            cells=local_scores(self._cells, self._local_weight, self.countries, regions),
+            last_cells=local_scores(last.cells, 1, last.countries.probabilities, last_regions) if last else (),
         )

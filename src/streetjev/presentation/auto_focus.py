@@ -11,7 +11,7 @@ class Bounds:
     bottom: float
 
 
-def focus_bounds(scores: dict[str, float], bounds: dict[str, Bounds]) -> Bounds | None:
+def focus_bounds(scores: dict[str, float], bounds: dict[str, Bounds], minimum=(30, 22)) -> Bounds | None:
     ranked = sorted(
         ((code, score) for code, score in scores.items() if code in bounds), key=lambda x: x[1], reverse=True
     )
@@ -28,6 +28,6 @@ def focus_bounds(scores: dict[str, float], bounds: dict[str, Bounds]) -> Bounds 
     if right - left > 110 or bottom - top > 95:
         return None
     # Не прыгаем к маленькому полигону: минимум несколько стран / крупный регион.
-    width, height = max(30, (right - left) * 1.25), max(22, (bottom - top) * 1.25)
+    width, height = max(minimum[0], (right - left) * 1.25), max(minimum[1], (bottom - top) * 1.25)
     cx, cy = (right + left) / 2, (bottom + top) / 2
     return Bounds(cx - width / 2, cy - height / 2, cx + width / 2, cy + height / 2)

@@ -1,5 +1,6 @@
 from dataclasses import dataclass
 
+from streetjev.domain.localization import LocalCell
 from streetjev.domain.round import RoundSnapshot
 
 
@@ -9,6 +10,7 @@ class DisplayScores:
     regions: dict[str, float]
     observed_regions: frozenset[str]
     active: bool
+    cells: tuple[LocalCell, ...] = ()
 
 
 def display_scores(snapshot: RoundSnapshot, source: str = "round") -> DisplayScores:
@@ -18,7 +20,12 @@ def display_scores(snapshot: RoundSnapshot, source: str = "round") -> DisplaySco
             snapshot.last_regions,
             snapshot.last_observed_regions,
             bool(snapshot.last_countries) and snapshot.last_unknown < 1,
+            snapshot.last_cells,
         )
     return DisplayScores(
-        snapshot.countries, snapshot.regions, snapshot.observed_regions, snapshot.effective_frames > 0
+        snapshot.countries,
+        snapshot.regions,
+        snapshot.observed_regions,
+        snapshot.effective_frames > 0,
+        snapshot.cells,
     )

@@ -4,18 +4,25 @@ from pathlib import Path
 
 from PIL import Image
 from PySide6.QtCore import QSettings, Qt, QThreadPool, QTimer
-from PySide6.QtGui import QPixmap
+from PySide6.QtGui import QIcon, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
     QFileDialog,
     QInputDialog,
     QMainWindow,
+    QStyle,
     QTableWidgetItem,
 )
 
 from streetjev.application.session import Session
+from streetjev.domain.calibration import CalibrationProfile
+from streetjev.domain.clues import apply_clues
+from streetjev.domain.ground_truth import GroundTruth
+from streetjev.infrastructure.calibration import read_profile
 from streetjev.infrastructure.capture import ScreenCapture, list_windows, prepare_image
-from streetjev.infrastructure.chipoint import ChipointExpert
+from streetjev.infrastructure.chipoint import ChipointExpert, GeographicLocator
+from streetjev.infrastructure.clues import load_clue_facts
+from streetjev.infrastructure.coverage import CoverageDensity
 from streetjev.infrastructure.demo import DemoExpert
 from streetjev.infrastructure.imajev import ImajevExpert
 from streetjev.infrastructure.storage import snapshot_json
@@ -33,8 +40,20 @@ class MainWindow(QMainWindow):
     def __init__(self, catalog, geography, repository, data_dir: Path, demo=False):
         super().__init__()
         self.catalog, self.repository = catalog, repository
+        self.data_dir = data_dir
         self.geography = geography
-        self.session = Session(catalog, repository)
+        self.locator = GeographicLocator(geography)
+        self.clue_facts = load_clue_facts(geography)
+        self.coverage = CoverageDensity()
+        self.profile = CalibrationProfile()
+        profile_error = None
+        if (data_dir / "calibration.json").exists():
+            try:
+                self.profile = read_profile(data_dir / "calibration.json", catalog)
+            except (OSError, ValueError, KeyError, TypeError) as exc:
+                profile_error = f"Профиль калибровки не загружен: {exc}"
+                log.warning("%s", profile_error)
+        self.session = Session(catalog, repository, self.profile)
         self.settings = QSettings(str(data_dir / "settings.ini"), QSettings.Format.IniFormat)
         self.demo_expert = DemoExpert(catalog)
         self.target = None
@@ -42,6 +61,7 @@ class MainWindow(QMainWindow):
         self.closing = False
         self.overlays = []
         self.chip_busy = False
+        self.refinement_busy = False
         self.chip_generation = 0
         self.pending_chip = {}
         self.failed_frames = set()
@@ -57,6 +77,11 @@ class MainWindow(QMainWindow):
         self.build_ui(geography, demo)
         self.update_snapshot()
         self.apply_hotkeys()
+        self.mode_badge.setToolTip(
+            "Профиль калибровки загружен" if self.profile.imajev_models else "Стандартные оценки"
+        )
+        if profile_error:
+            self.status.setText(profile_error)
 
     def build_ui(self, geography, demo):
         from streetjev.presentation.layout import build_window
@@ -64,7 +89,7 @@ class MainWindow(QMainWindow):
         build_window(self, geography, demo)
 
     def model_settings_changed(self):
-        current = (self.url.text().strip(), self.beam.value())
+        current = (self.url.text().strip(), self.beam.value(), self.coverage_enabled.isChecked())
         if hasattr(self, "_model_settings") and current != self._model_settings:
             self._model_settings = current
             self.auto.setChecked(False)
@@ -78,8 +103,41 @@ class MainWindow(QMainWindow):
         self.file_button.setEnabled(not demo and not self.busy)
         self.url.setEnabled(not demo and not self.busy)
         self.beam.setEnabled(not demo and not self.busy)
+        self.coverage_enabled.setEnabled(not demo and not self.busy)
         self.analyze_button.setText("Демо-кадр" if demo else "Снимок")
         self.chip_enabled.setEnabled(not demo)
+        self.answer_button.setEnabled(self.session.round.frames > 0 and not self.busy)
+
+    def answer_mode_changed(self, enabled):
+        self.map.set_answer_mode(enabled)
+        if enabled:
+            self.auto.setChecked(False)
+            self.auto_focus.setChecked(False)
+            self.status.setText("Кликните по правильному месту; карту можно приближать и перемещать")
+
+    def save_answer(self, latitude, longitude):
+        if self.busy or self.closing:
+            return
+        country, region = self.locator.locate(latitude, longitude)
+        if country is None:
+            self.status.setText("Здесь не определена страна. Приблизьте карту и уточните точку")
+            return
+        truth = GroundTruth(latitude, longitude, country, region)
+        try:
+            self.session.label(truth)
+        except Exception as exc:
+            log.exception("Не удалось сохранить правильный ответ")
+            self.status.setText(f"Ответ не сохранён: {exc}")
+            return
+        self.auto.setChecked(False)
+        self.answer_button.setChecked(False)
+        self.answer_button.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_DialogApplyButton))
+        caption = self.catalog.countries[country].label
+        if region:
+            caption += " · " + self.catalog.regions[region].label
+        self.answer_button.setToolTip(f"{caption}\n{latitude:.5f}, {longitude:.5f}\nНажмите, чтобы исправить")
+        self.map.show_answer(truth)
+        self.status.setText(f"Сохранено: {caption}. «Сброс» — следующий раунд")
 
     def mode_changed(self):
         self.auto.setChecked(False)
@@ -187,11 +245,21 @@ class MainWindow(QMainWindow):
     def start_analysis(self, capture):
         if self.busy or self.closing:
             return
+        if self.session.truth is not None:
+            self.auto.setChecked(False)
+            self.status.setText("Ответ сохранён. Нажмите «Сброс» для следующего раунда")
+            return
         try:
             expert = (
                 self.demo_expert
                 if self.demo.isChecked()
-                else ImajevExpert(self.catalog, self.url.text().strip(), self.beam.value())
+                else ImajevExpert(
+                    self.catalog,
+                    self.url.text().strip(),
+                    self.beam.value(),
+                    facts=self.clue_facts,
+                    profile=self.profile,
+                )
             )
         except ValueError as exc:
             self.status.setText(str(exc))
@@ -272,11 +340,20 @@ class MainWindow(QMainWindow):
             self.status.setText(f"Не удалось создать раунд: {exc}")
             return
         self.demo_expert = DemoExpert(self.catalog)
+        self.answer_button.setChecked(False)
+        self.answer_button.setText("Ответ")
+        self.answer_button.setIcon(QIcon())
+        self.answer_button.setToolTip("Отметить правильное место на карте; повторная отметка исправляет ответ")
+        self.map.show_answer()
         self.chip_generation += 1
         self.pending_chip.clear()
         self.failed_frames.clear()
         self.chip_status.setText(
-            "завершается…" if self.chip_busy else "готов" if self.chip_enabled.isChecked() else "выкл."
+            "завершается…"
+            if self.chip_busy or self.refinement_busy
+            else "готов"
+            if self.chip_enabled.isChecked()
+            else "выкл."
         )
         self.preview.clear()
         self.preview.hide()
@@ -286,6 +363,7 @@ class MainWindow(QMainWindow):
 
     def update_snapshot(self):
         snapshot = self.session.round.snapshot()
+        self.answer_button.setEnabled(snapshot.frames > 0 and not self.busy)
         self.map.source = "last" if self.score_source.currentIndex() else "round"
         self.map.scale_mode = "absolute" if self.color_scale.currentIndex() else "relative"
         self.map.update_snapshot(snapshot)
@@ -307,8 +385,16 @@ class MainWindow(QMainWindow):
         )
         selected = display_scores(snapshot, self.map.source)
         regional = self.level.currentIndex() == 1
+        local = self.level.currentIndex() == 2
+        cells = {cell.code: cell for cell in selected.cells}
         places = self.catalog.regions if regional else self.catalog.countries
-        probabilities = selected.regions if regional else selected.countries
+        probabilities = (
+            {key: cell.mass for key, cell in cells.items()}
+            if local
+            else selected.regions
+            if regional
+            else selected.countries
+        )
         if regional:
             probabilities = {
                 k: p for k, p in probabilities.items() if places[k].country_code in selected.observed_regions
@@ -321,19 +407,33 @@ class MainWindow(QMainWindow):
         self.fit_side_panel()
         if selected.active:
             for row, (key, _probability) in enumerate(ranked):
-                name = places[key].label
+                if local:
+                    cell = cells[key]
+                    lat, lon = cell.center
+                    place = self.catalog.regions.get(cell.region) or self.catalog.countries[cell.country]
+                    name = f"{lat:.2f}, {lon:.2f} · {place.label}"
+                else:
+                    name = places[key].label
                 if regional:
                     name += " · " + places[key].country_code
                 item = QTableWidgetItem(name)
-                item.setData(Qt.ItemDataRole.UserRole, places[key].country_code or key)
+                item.setData(Qt.ItemDataRole.UserRole, key if local else places[key].country_code or key)
+                item.setToolTip(name + ("\nЗона поиска ≈10 км; двойной клик — приблизить" if local else ""))
                 self.ranking.setItem(row, 0, item)
                 for column, source in ((1, "round"), (2, "last")):
                     scores = display_scores(snapshot, source)
                     available = scores.active and (
                         not regional or places[key].country_code in scores.observed_regions
                     )
-                    value = (scores.regions if regional else scores.countries).get(key, 0)
+                    if local:
+                        values = {cell.code: cell.mass for cell in scores.cells}
+                        value, available = values.get(key, 0), key in values
+                    else:
+                        value = (scores.regions if regional else scores.countries).get(key, 0)
                     self.ranking.setItem(row, column, QTableWidgetItem(format_score(value) if available else "—"))
+        if local and not selected.cells:
+            self.scale_caption.setText("Нет зон")
+            self.scale_caption.setToolTip("Для уточнения внутри региона включите Chipoint и проанализируйте кадр")
 
     def display_changed(self):
         self.update_snapshot()
@@ -365,20 +465,26 @@ class MainWindow(QMainWindow):
 
     def level_changed(self):
         if hasattr(self, "map"):
-            self.map.set_level("regions" if self.level.currentIndex() else "countries")
+            self.map.set_level(("countries", "regions", "local")[self.level.currentIndex()])
             self.update_snapshot()
 
     def focus_leader(self):
         self.auto_focus.setChecked(False)
         scores = display_scores(self.session.round.snapshot(), self.map.source)
         if scores.active:
-            self.map.focus_country(max(scores.countries, key=scores.countries.get))
+            if self.map.level == "local" and scores.cells:
+                self.map.focus_cell(max(scores.cells, key=lambda cell: cell.mass).code)
+            else:
+                self.map.focus_country(max(scores.countries, key=scores.countries.get))
 
     def focus_ranked(self, row, column):
         self.auto_focus.setChecked(False)
         item = self.ranking.item(row, 0)
         if item:
-            self.map.focus_country(item.data(Qt.ItemDataRole.UserRole))
+            if self.map.level == "local":
+                self.map.focus_cell(item.data(Qt.ItemDataRole.UserRole))
+            else:
+                self.map.focus_country(item.data(Qt.ItemDataRole.UserRole))
 
     def apply_hotkeys(self):
         try:
@@ -400,9 +506,12 @@ class MainWindow(QMainWindow):
             try:
                 data = json.loads(snapshot_json(self.session.round.snapshot()))
                 data["mode"] = "demo" if self.demo.isChecked() else "imajev"
-                data["calibrated_for_geography"] = False
+                from dataclasses import asdict
+
+                data["calibration_profile"] = asdict(self.profile) if self.profile.imajev_models else None
+                data["ground_truth"] = asdict(self.session.truth) if self.session.truth else None
                 data["chipoint_enabled"] = self.chip_enabled.isChecked()
-                data["fusion"] = "linear_experts_v1" if self.chip_enabled.isChecked() else None
+                data["fusion"] = "linear_experts_v2" if self.chip_enabled.isChecked() else None
                 Path(path).write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
                 self.status.setText("Текущее распределение экспортировано.")
             except OSError as exc:
@@ -417,6 +526,7 @@ class MainWindow(QMainWindow):
             event.ignore()
             return
         self.hotkeys.close()
+        self.tiles.close()
         self.closing = True
         self.chip_generation += 1
         for name, value in {
@@ -429,6 +539,8 @@ class MainWindow(QMainWindow):
             "chip_enabled": self.chip_enabled.isChecked(),
             "chip_url": self.chip_url.text(),
             "chip_timeout": self.chip_timeout.value(),
+            "coverage_enabled": self.coverage_enabled.isChecked(),
+            "map_details": self.details.isChecked(),
         }.items():
             self.settings.setValue(name, value)
         self.settings.sync()
@@ -472,12 +584,17 @@ class MainWindow(QMainWindow):
             or self.closing
         ):
             return
-        if self.chip_busy:
+        if self.chip_busy or self.refinement_busy:
             self.chip_status.setToolTip("Предыдущий запрос ещё выполняется; новый кадр обрабатывает только imajev")
             return
         try:
             expert = ChipointExpert(
-                self.catalog, self.geography, self.chip_url.text().strip(), self.chip_timeout.value()
+                self.catalog,
+                self.geography,
+                self.chip_url.text().strip(),
+                self.chip_timeout.value(),
+                coverage=self.coverage if self.coverage_enabled.isChecked() else None,
+                profile=self.profile,
             )
         except ValueError as exc:
             self.chip_status.setText("ошибка адреса")
@@ -487,7 +604,7 @@ class MainWindow(QMainWindow):
         self.chip_busy = True
         self.chip_status.setText("поиск…")
         self.chip_status.setToolTip("Поиск Chipoint. imajev продолжает работать независимо.")
-        worker = SupplementWorker(request, expert)
+        worker = SupplementWorker(request, expert.infer)
         worker.signals.completed.connect(lambda result: self.chipoint_complete(generation, result))
         worker.signals.failed.connect(lambda rid, message: self.chipoint_failed(generation, rid, message))
         worker.signals.finished.connect(self.chipoint_finished)
@@ -506,15 +623,75 @@ class MainWindow(QMainWindow):
             self.chip_status.setText("ждёт imajev")
 
     def accept_chipoint(self, result):
+        from dataclasses import replace
+
         try:
+            primary = self.session.observation(result.frame.id)
+            if primary is None:
+                return
+            parameters = self.profile.for_model("chipoint", result.evidence.model_version)
+            result = replace(
+                result,
+                evidence=apply_clues(
+                    result.evidence,
+                    primary.evidence.clues,
+                    self.clue_facts,
+                    parameters.driving_strength,
+                    parameters.hemisphere_strength,
+                ),
+            )
             if self.session.supplement(result):
                 self.chip_status.setText(f"{result.evidence.elapsed_ms / 1000:.1f} с")
-                self.chip_status.setToolTip("Кадр дополнен Chipoint Street Retrieval; вес 35%, без reranker")
+                weight = self.profile.fusion_weight(primary.evidence.model_version, result.evidence.model_version)
+                self.chip_status.setToolTip(
+                    f"Кадр дополнен Chipoint Street Retrieval; вес {weight:.0%}, без reranker"
+                )
                 self.update_snapshot()
+                self.start_refinement(primary, result)
         except Exception as exc:
             self.chip_status.setText("ошибка сохранения")
             self.chip_status.setToolTip(str(exc))
             log.exception("Ошибка сохранения Chipoint")
+
+    def start_refinement(self, primary, secondary):
+        expert = ImajevExpert(
+            self.catalog, self.url.text().strip(), self.beam.value(), facts=self.clue_facts, profile=self.profile
+        )
+        if not expert.missing_regions(primary.evidence, secondary.evidence):
+            return
+        generation = self.chip_generation
+        self.refinement_busy = True
+        self.chip_status.setText("регионы…")
+        worker = SupplementWorker(
+            secondary, lambda frame: expert.refine(frame, primary.evidence, secondary.evidence)
+        )
+        worker.signals.completed.connect(lambda result: self.refinement_complete(generation, result))
+        worker.signals.failed.connect(lambda rid, message: self.refinement_failed(generation, rid, message))
+        worker.signals.finished.connect(self.refinement_finished)
+        self.refinement_worker = worker
+        worker.start()
+
+    def refinement_complete(self, generation, result):
+        if self.closing or generation != self.chip_generation or result.round_id != self.session.round.id:
+            return
+        try:
+            if self.session.refine(result):
+                self.update_snapshot()
+                self.chip_status.setText("уточнён")
+                self.chip_status.setToolTip("imajev проверил дополнительные страны Chipoint на том же кадре")
+        except Exception as exc:
+            log.exception("Не удалось сохранить уточнение регионов")
+            self.refinement_failed(generation, result.round_id, str(exc))
+
+    def refinement_failed(self, generation, round_id, message):
+        if not self.closing and generation == self.chip_generation and round_id == self.session.round.id:
+            self.chip_status.setText("без уточнения")
+            self.chip_status.setToolTip("Результаты обеих моделей сохранены. Уточнение регионов: " + message)
+
+    def refinement_finished(self):
+        self.refinement_busy = False
+        if not self.closing and not self.chip_busy and self.chip_status.text() == "завершается…":
+            self.chip_status.setText("готов" if self.chip_enabled.isChecked() else "выкл.")
 
     def chipoint_failed(self, generation, round_id, message):
         if not self.closing and generation == self.chip_generation and round_id == self.session.round.id:
@@ -526,7 +703,7 @@ class MainWindow(QMainWindow):
 
     def chipoint_finished(self):
         self.chip_busy = False
-        if not self.closing and self.chip_status.text() == "завершается…":
+        if not self.closing and not self.refinement_busy and self.chip_status.text() == "завершается…":
             self.chip_status.setText("готов" if self.chip_enabled.isChecked() else "выкл.")
 
     def fit_side_panel(self):

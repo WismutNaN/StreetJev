@@ -23,6 +23,7 @@ from PySide6.QtWidgets import (
 )
 
 from streetjev.presentation.map_view import MapView
+from streetjev.presentation.tile_layer import TileLayer
 
 
 def label(text="", name="muted"):
@@ -62,6 +63,11 @@ def build_window(w, geography, demo):
     w.interval.setButtonSymbols(QSpinBox.ButtonSymbols.NoButtons)
     w.reset_button = button("Сброс", w.reset_round, "Начать новый раунд · Ctrl+Alt+R")
     w.reset_button.setObjectName("reset")
+    w.answer_button = button(
+        "Ответ", lambda: None, "Отметить правильное место на карте; повторная отметка исправляет ответ"
+    )
+    w.answer_button.setCheckable(True)
+    w.answer_button.toggled.connect(w.answer_mode_changed)
     for widget in (
         w.region_button,
         w.window_button,
@@ -70,6 +76,7 @@ def build_window(w, geography, demo):
         w.auto,
         w.interval,
         w.reset_button,
+        w.answer_button,
     ):
         actions.addWidget(widget)
     actions.addSpacing(8)
@@ -93,7 +100,8 @@ def build_window(w, geography, demo):
     view.addWidget(w.mode_badge)
     view.addStretch()
     w.level = QComboBox()
-    w.level.addItems(["Страны", "Регионы"])
+    w.level.addItems(["Страны", "Регионы", "Зоны · 10 км"])
+    w.level.setToolTip("Зоны — участки поиска по координатам Chipoint, не административные районы")
     w.level.currentIndexChanged.connect(w.level_changed)
     w.score_source = QComboBox()
     w.score_source.addItems(["Раунд", "Кадр"])
@@ -112,12 +120,19 @@ def build_window(w, geography, demo):
         view.addWidget(widget)
     view.addWidget(button("Мир", w.show_world))
     view.addWidget(button("Лидер", w.focus_leader))
+    w.details = QCheckBox("Детали")
+    w.details.setToolTip("Города, дороги и улицы OpenStreetMap. Нужен интернет; просмотренные тайлы кэшируются")
+    view.addWidget(w.details)
     root.addLayout(view)
 
     canvas = QWidget()
     canvas_layout = QGridLayout(canvas)
     canvas_layout.setContentsMargins(0, 0, 0, 0)
     w.map = MapView(w.catalog, geography)
+    w.tiles = TileLayer(w.map, w.data_dir / "map-cache")
+    w.details.toggled.connect(w.tiles.set_enabled)
+    w.details.setChecked(str(w.settings.value("map_details", "true")).lower() == "true" and not demo)
+    w.map.answer_clicked.connect(w.save_answer)
     w.map.country_clicked.connect(lambda _: w.level.setCurrentIndex(1))
     w.map.manual_navigation.connect(lambda: w.auto_focus.setChecked(False))
     w.auto_focus.toggled.connect(w.auto_focus_changed)
@@ -182,7 +197,7 @@ def build_window(w, geography, demo):
     w.setCentralWidget(container)
     build_settings(w, demo)
     w.set_mode_ui()
-    w._model_settings = (w.url.text().strip(), w.beam.value())
+    w._model_settings = (w.url.text().strip(), w.beam.value(), w.coverage_enabled.isChecked())
     w.chip_enabled.toggled.connect(w.chipoint_changed)
     w.chip_enabled.setChecked(str(w.settings.value("chip_enabled", "false")).lower() == "true" and not demo)
 
@@ -212,13 +227,22 @@ def build_settings(w, demo):
     w.chip_timeout.setValue(int(w.settings.value("chip_timeout", 20)))
     form.addRow("Chipoint", w.chip_url)
     form.addRow("Ожидание Chipoint", w.chip_timeout)
+    w.coverage_enabled = QCheckBox("Учитывать покрытие Street View")
+    w.coverage_enabled.setChecked(str(w.settings.value("coverage_enabled", "true")).lower() == "true")
+    w.coverage_enabled.setToolTip(
+        "Небольшая поправка по плотности покрытия рядом с точками Chipoint. "
+        "Нужен интернет; Google получает координаты тайлов, изображение не отправляется. "
+        "При недоступности покрытия оценки не меняются."
+    )
+    w.coverage_enabled.toggled.connect(w.model_settings_changed)
+    form.addRow(w.coverage_enabled)
     w.capture_key = QKeySequenceEdit(QKeySequence(str(w.settings.value("capture_key", "Ctrl+Alt+G"))))
     w.reset_key = QKeySequenceEdit(QKeySequence(str(w.settings.value("reset_key", "Ctrl+Alt+R"))))
     form.addRow("Снимок", w.capture_key)
     form.addRow("Сброс", w.reset_key)
     form.addRow(button("Применить клавиши", w.apply_hotkeys))
     note = label(
-        "Chipoint: street retrieval, без финального reranker.\nВес в объединении: 35%. Оценки не откалиброваны.\nСлужба: services/chipoint/manage.py start"
+        "Chipoint: street retrieval, без финального reranker.\nВес по умолчанию: 35%; профиль калибровки может изменить его.\nСлужба: services/chipoint/manage.py start"
     )
     note.setWordWrap(True)
     form.addRow(note)

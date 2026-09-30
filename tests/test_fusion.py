@@ -30,13 +30,14 @@ def test_unknown_expert_does_not_move_known_country():
     assert fuse_evidence(evidence(unknown=1), secondary(unknown=1)).countries.unknown == 1
 
 
-def test_region_fusion_uses_country_support():
+def test_conditional_regions_do_not_repeat_country_vote():
     primary = evidence(at=0.8, regions={"AT": Distribution({"AT-7": 0.9, "AT-5": 0.1})})
     other = secondary(at=0.2, regions={"AT": Distribution({"AT-7": 0.1, "AT-5": 0.9})})
     result = fuse_evidence(primary, other)
-    assert result.regions["AT"].probabilities["AT-7"] == pytest.approx(
-        (0.65 * 0.8 * 0.9 + 0.35 * 0.2 * 0.1) / (0.65 * 0.8 + 0.35 * 0.2)
-    )
+    assert result.regions["AT"].probabilities["AT-7"] == pytest.approx(0.62)
+    # Даже ветвь страны с исходным нулём участвует после проверки по подсказке Chipoint.
+    primary = replace(primary, countries=Distribution({"AT": 0, "DE": 1}))
+    assert fuse_evidence(primary, other).regions["AT"].probabilities["AT-7"] == pytest.approx(0.62)
 
 
 def test_late_result_replaces_same_frame_and_does_not_become_last(catalog, tmp_path):

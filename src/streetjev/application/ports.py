@@ -1,6 +1,7 @@
 from typing import Protocol
 
 from streetjev.domain.evidence import Frame, GeoEvidence
+from streetjev.domain.ground_truth import GroundTruth
 from streetjev.domain.round import RoundSnapshot
 
 
@@ -19,4 +20,8 @@ class RoundRepository(Protocol):
 
     def supplement(self, snapshot: RoundSnapshot, frame: Frame, evidence: GeoEvidence, weight: float) -> None: ...
 
+    def refine(self, snapshot: RoundSnapshot, frame: Frame, evidence: GeoEvidence) -> None: ...
+
     def disable_supplements(self, snapshot: RoundSnapshot) -> None: ...
+
+    def label(self, round_id: str, truth: GroundTruth) -> None: ...

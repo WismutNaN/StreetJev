@@ -1,8 +1,10 @@
 """Объединение экспертов одного кадра до временного накопления."""
 
 import json
+from dataclasses import replace
 
 from streetjev.domain.evidence import Distribution, GeoEvidence
+from streetjev.domain.localization import combine_cells
 
 
 def fuse_evidence(primary: GeoEvidence, secondary: GeoEvidence, secondary_weight: float = 0.35) -> GeoEvidence:
@@ -22,11 +24,9 @@ def fuse_evidence(primary: GeoEvidence, secondary: GeoEvidence, secondary_weight
     )
     regions = {}
     for country in set(primary.regions) | set(secondary.regions):
-        contributors = [
-            (e.regions[country], weight * e.countries.probabilities[country])
-            for e, weight in weights
-            if country in e.regions
-        ]
+        # Оба ответа условны на эту страну. Повторное умножение на её исходный рейтинг
+        # подавляло бы ветвь imajev, которую нашли благодаря Chipoint.
+        contributors = [(e.regions[country], weight) for e, weight in weights if country in e.regions]
         keys = set(contributors[0][0].probabilities)
         if any(set(d.probabilities) != keys for d, _ in contributors):
             raise ValueError("Эксперты используют разные каталоги регионов")
@@ -41,7 +41,7 @@ def fuse_evidence(primary: GeoEvidence, secondary: GeoEvidence, secondary_weight
         )
     return GeoEvidence(
         "late_fusion",
-        "linear_experts_v1",
+        "linear_experts_v2",
         countries,
         regions,
         json.dumps(
@@ -53,4 +53,7 @@ def fuse_evidence(primary: GeoEvidence, secondary: GeoEvidence, secondary_weight
             }
         ),
         max(primary.elapsed_ms, secondary.elapsed_ms),
+        cells=combine_cells(
+            replace(cell, mass=cell.mass * weight) for expert, weight in experts for cell in expert.cells
+        ),
     )

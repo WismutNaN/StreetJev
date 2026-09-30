@@ -1,8 +1,10 @@
 import json
 import time
+from dataclasses import replace
 
 import httpx
 
+from streetjev.domain.calibration import CalibrationProfile, adjust_imajev
 from streetjev.domain.evidence import Distribution, Frame, GeoEvidence
 from streetjev.domain.geography import GeoCatalog
 
@@ -21,6 +23,8 @@ class ImajevExpert:
         beam: int = 3,
         timeout: float = 90,
         transport=None,
+        facts=None,
+        profile=None,
     ):
         url = httpx.URL(base_url)
         if url.scheme not in ("http", "https") or not url.host:
@@ -32,6 +36,89 @@ class ImajevExpert:
         self.catalog, self.beam = catalog, beam
         self.endpoint = base_url.rstrip("/") + "/v1/systemone"
         self.timeout, self.transport = timeout, transport
+        self.facts = facts or {}
+        self.profile = profile or CalibrationProfile()
+
+    def decode(self, raw_json, elapsed_ms=0):
+        """Восстанавливает исходные оценки API, без повторных запросов и поправок."""
+        raw = json.loads(raw_json)
+        response = raw["country"]
+        countries = self._distribution(response["answers"]["country"], set(self.catalog.countries))
+        clues = {}
+        for key, choices in (
+            ("driving_side", {"left", "right", "unclear"}),
+            ("hemisphere", {"north", "south", "unclear"}),
+        ):
+            if key in response["answers"]:
+                clues[key] = self._distribution(response["answers"][key], choices)
+        regions = {}
+        for branch in (raw.get("regions"), raw.get("chipoint_region_refinement")):
+            for key, value in (branch or {}).get("answers", {}).items():
+                code = key.removeprefix("region_")
+                if not key.startswith("region_") or code not in self.catalog.countries:
+                    raise ValueError("Неизвестная региональная ветвь")
+                regions[code] = self._distribution(value, {r.code for r in self.catalog.regions_of(code)})
+        return GeoEvidence(
+            "imajev_hierarchical",
+            str(response.get("model", "imajev")),
+            countries,
+            regions,
+            raw_json,
+            elapsed_ms,
+            clues,
+        )
+
+    def region_candidates(self, evidence):
+        if evidence.countries.unknown >= 0.8:
+            return []
+        scores = evidence.countries.probabilities
+        return [code for code in sorted(scores, key=scores.get, reverse=True) if scores[code] > 0][: self.beam]
+
+    def missing_regions(self, primary, secondary):
+        return [
+            code
+            for code in self.region_candidates(secondary)
+            if code not in primary.regions and 2 <= len(self.catalog.regions_of(code)) <= 254
+        ]
+
+    def _regions(self, client, frame, codes):
+        questions = {}
+        for country in codes:
+            regions = self.catalog.regions_of(country)
+            if 2 <= len(regions) <= 254:
+                questions["region_" + country] = {
+                    "type": "choice",
+                    "instructions": f"Assuming the image is in {self.catalog.countries[country].name}, "
+                    "which administrative region is most consistent with the visible clues?",
+                    "criteria": {p.code: p.name for p in regions},
+                }
+        if not questions:
+            return {}, None
+        response = self._request(client, frame, questions)
+        return {
+            key.removeprefix("region_"): self._distribution(response["answers"][key], set(q["criteria"]))
+            for key, q in questions.items()
+        }, response
+
+    def refine(self, frame, primary, secondary):
+        """Только недостающие ветви Chipoint. Повторно страну и признаки не спрашиваем."""
+        codes = self.missing_regions(primary, secondary)
+        if not codes:
+            return primary
+        started = time.perf_counter()
+        with httpx.Client(timeout=self.timeout, transport=self.transport, trust_env=False) as client:
+            regions, response = self._regions(client, frame, codes)
+        extra = replace(primary, regions=regions)
+        # Страны уже скорректированы; здесь уточняются только новые региональные ветви.
+        adjusted = adjust_imajev(extra, self.profile.for_model("imajev", primary.model_version), self.facts)
+        raw = json.loads(primary.raw_json)
+        raw["chipoint_region_refinement"] = response
+        return replace(
+            primary,
+            regions={**primary.regions, **adjusted.regions},
+            raw_json=json.dumps(raw, ensure_ascii=False),
+            elapsed_ms=primary.elapsed_ms + (time.perf_counter() - started) * 1000,
+        )
 
     @staticmethod
     def _distribution(answer: dict, keys: set[str]) -> Distribution:
@@ -69,39 +156,60 @@ class ImajevExpert:
                             "type": "choice",
                             "instructions": "Which country or territory was this image most likely captured in?",
                             "criteria": {p.code: p.name for p in self.catalog.countries.values()},
-                        }
+                        },
+                        "driving_side": {
+                            "type": "choice",
+                            "instructions": "Which side of a two-way road does traffic keep to? Use visible moving "
+                            "traffic and road layout only. Do not infer from a guessed country, the camera's lane, "
+                            "a single parked car or a one-way road. Choose unclear if not directly supported.",
+                            "criteria": {
+                                "left": "Left-hand traffic",
+                                "right": "Right-hand traffic",
+                                "unclear": "Not visible or ambiguous",
+                            },
+                        },
+                        "hemisphere": {
+                            "type": "choice",
+                            "instructions": "Is there direct visible evidence for north or south of the equator? "
+                            "Do not infer from the country guess, driving side or generic vegetation. The sun or "
+                            "shadows without a readable compass/north orientation are insufficient. Season, time "
+                            "of day and tropical locations make solar clues ambiguous. Choose unclear unless "
+                            "the visible evidence distinguishes the hemispheres.",
+                            "criteria": {
+                                "north": "Northern hemisphere",
+                                "south": "Southern hemisphere",
+                                "unclear": "Insufficient or ambiguous evidence",
+                            },
+                        },
                     },
                 )
                 countries = self._distribution(country_response["answers"]["country"], set(self.catalog.countries))
-                top = sorted(countries.probabilities, key=countries.probabilities.get, reverse=True)[: self.beam]
-                questions, expected = {}, {}
-                if countries.unknown < 0.8:
-                    for country in top:
-                        regions = self.catalog.regions_of(country)
-                        if 2 <= len(regions) <= 254:
-                            key = "region_" + country
-                            questions[key] = {
-                                "type": "choice",
-                                "instructions": f"Assuming the image is in {self.catalog.countries[country].name}, "
-                                "which administrative region is most consistent with the visible clues?",
-                                "criteria": {p.code: p.name for p in regions},
-                            }
-                            expected[key] = country
-                regions, region_response = {}, None
-                if questions:
-                    region_response = self._request(client, frame, questions)
-                    for key, country in expected.items():
-                        regions[country] = self._distribution(
-                            region_response["answers"][key], {p.code for p in self.catalog.regions_of(country)}
-                        )
-                raw = json.dumps({"country": country_response, "regions": region_response}, ensure_ascii=False)
-                return GeoEvidence(
+                clues = {}
+                for key, choices in (
+                    ("driving_side", {"left", "right", "unclear"}),
+                    ("hemisphere", {"north", "south", "unclear"}),
+                ):
+                    if key in country_response["answers"]:
+                        clues[key] = self._distribution(country_response["answers"][key], choices)
+                base = GeoEvidence(
                     "imajev_hierarchical",
                     str(country_response.get("model", "imajev")),
                     countries,
-                    regions,
-                    raw,
-                    (time.perf_counter() - started) * 1000,
+                    {},
+                    "{}",
+                    0,
+                    clues,
+                )
+                parameters = self.profile.for_model("imajev", base.model_version)
+                adjusted = adjust_imajev(base, parameters, self.facts)
+                regions, region_response = self._regions(client, frame, self.region_candidates(adjusted))
+                raw = json.dumps({"country": country_response, "regions": region_response}, ensure_ascii=False)
+                return adjust_imajev(
+                    replace(
+                        base, regions=regions, raw_json=raw, elapsed_ms=(time.perf_counter() - started) * 1000
+                    ),
+                    parameters,
+                    self.facts,
                 )
         except httpx.ConnectError as exc:
             raise InferenceError(
