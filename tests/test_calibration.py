@@ -95,6 +95,8 @@ def test_grouped_split_and_fitting_calibrates_overconfidence(catalog):
         < report["validation"]["baseline"]["country_log_loss"]
     )
     assert report["validation"]["candidate"]["country_accuracy"] == 0.5
+    assert report["validation"]["candidate"]["country_top5_accuracy"] == 1
+    assert report["validation"]["candidate"]["region_top5_accuracy"] == 1
     assert best.secondary_weight == 0.35  # Нет второго эксперта: его вес не меняется.
     # Изменение только проверочных меток не должно менять подобранные параметры.
     validation_ids = {s.id for s in validation}
@@ -110,6 +112,38 @@ def test_grouped_split_and_fitting_calibrates_overconfidence(catalog):
         {"loss": 1, "country_accuracy": 0.4, "region_accuracy": None},
         {"loss": 2, "country_accuracy": 0.5, "region_accuracy": None},
     )
+
+
+def test_fresh_holdout_never_reuses_old_locations(catalog):
+    samples = sample_rounds(catalog)
+    fresh_ids = {sample.id for sample in samples[8:]}
+    # Новый раунд в уже использованной географической ячейке остаётся в training.
+    fresh_ids.add(samples[1].id)
+    training, validation = split_rounds(samples, validation_pool=fresh_ids)
+    assert len({s.group for s in validation}) == 4
+    assert {s.id for s in validation} <= fresh_ids
+    assert samples[1] in training
+    assert not {s.group for s in validation} & {s.group for s in training}
+    assert split_rounds(samples, validation_pool=fresh_ids) == (training, validation)
+    with pytest.raises(ValueError, match="4 новые"):
+        split_rounds(samples, validation_pool={s.id for s in samples[-6:]})
+    # При недостатке новых мест старые не подмешиваются в проверку.
+    with pytest.raises(ValueError, match="4 новые"):
+        split_rounds(samples, validation_pool={s.id for s in samples[1::2]})
+
+
+def test_improvement_must_preserve_candidate_recall():
+    baseline = {
+        "loss": 3,
+        "country_accuracy": 0.75,
+        "region_accuracy": 0,
+        "country_top5_accuracy": 1,
+        "region_top5_accuracy": 0.25,
+    }
+    improved = {**baseline, "loss": 2}
+    assert improves(improved, baseline)
+    assert not improves({**improved, "country_top5_accuracy": 0.875}, baseline)
+    assert not improves({**improved, "region_top5_accuracy": 0.125}, baseline)
 
 
 def test_raw_replay_matches_live_profile_and_keeps_db_readonly(catalog, tmp_path):
@@ -234,8 +268,10 @@ def test_cli_report_apply_backup_and_no_replacement_without_improvement(catalog,
     repo.close()
     before = path.read_bytes()
     output = tmp_path / "reports"
-    report = command.calibrate(path, output, progress=None)
+    report = command.calibrate(path, output, progress=None, objective="geographic")
     assert report["eligible_to_apply"] and not report["applied"]
+    assert report["objective"] == "geographic"
+    assert report["validation"]["candidate"]["point_rounds"] == 0
     assert not active.exists()
     assert (output / "report.json").is_file() and (output / "profile.json").is_file()
     old = CalibrationProfile(CalibrationParameters(), ("imajev-test",))
@@ -249,3 +285,10 @@ def test_cli_report_apply_backup_and_no_replacement_without_improvement(catalog,
     assert not report["applied"]  # Та же калибровка не считается новым улучшением.
     assert active.read_bytes() == saved
     assert path.read_bytes() == before
+    previous = output / "report.json"
+    old_report = previous.read_bytes()
+    with pytest.raises(ValueError, match="прежний"):
+        command.calibrate(path, output, previous_report=previous, progress=None)
+    with pytest.raises(ValueError, match="4 новые"):
+        command.calibrate(path, tmp_path / "next", apply=True, previous_report=previous, progress=None)
+    assert previous.read_bytes() == old_report and active.read_bytes() == saved

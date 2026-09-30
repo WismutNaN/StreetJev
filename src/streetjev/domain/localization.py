@@ -5,6 +5,21 @@ from dataclasses import dataclass, replace
 
 ROWS = 2000
 LATITUDE_STEP = 180 / ROWS
+EARTH_RADIUS_KM = 6371.0088
+
+
+def distance_km(latitude_a, longitude_a, latitude_b, longitude_b):
+    """Кратчайшее расстояние по сфере, включая полюса и антимеридиан."""
+    a, b = math.radians(latitude_a), math.radians(latitude_b)
+    delta = math.radians(longitude_b - longitude_a)
+    value = math.sin((b - a) / 2) ** 2 + math.cos(a) * math.cos(b) * math.sin(delta / 2) ** 2
+    value = min(1, max(0, value))
+    return 2 * EARTH_RADIUS_KM * math.atan2(math.sqrt(value), math.sqrt(1 - value))
+
+
+def strongest_point(points, country):
+    """Координата с максимальной поддержкой внутри страны, как в иерархии карты."""
+    return max((p for p in points if p.country == country and p.mass > 0), key=lambda p: p.mass, default=None)
 
 
 @dataclass(frozen=True)

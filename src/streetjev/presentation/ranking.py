@@ -2,6 +2,8 @@
 
 from dataclasses import dataclass
 
+from streetjev.domain.localization import strongest_point
+
 
 @dataclass(frozen=True)
 class RankedPlace:
@@ -20,8 +22,7 @@ def ranked_places(catalog, scores, subregions=None, support=None, assignments=No
         if scores.countries[country] <= 0:
             continue
         result.append(RankedPlace("country", country, catalog.countries[country].label, country))
-        points = [p for p in scores.points if p.country == country]
-        point = max(points, key=lambda p: p.mass) if points else None
+        point = strongest_point(scores.points, country)
         regions = (
             sorted(
                 (r.code for r in catalog.regions_of(country)),
