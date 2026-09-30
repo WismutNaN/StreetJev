@@ -1,12 +1,17 @@
-from PySide6.QtCore import QEvent, QLineF, QPointF, QRectF, Qt, Signal
+import math
+from itertools import pairwise
+
+from PySide6.QtCore import QEvent, QLineF, QPointF, QRectF, Qt, QTimer, Signal
 from PySide6.QtGui import QBrush, QColor, QFont, QPainter, QPainterPath, QPen, QStaticText
 from PySide6.QtWidgets import QGraphicsItem, QGraphicsPathItem, QGraphicsScene, QGraphicsView, QToolTip
+from shapely.geometry import LineString
 
 from streetjev.domain.geography import GeoCatalog
 from streetjev.domain.round import RoundSnapshot
 from streetjev.presentation.auto_focus import Bounds, focus_bounds
 from streetjev.presentation.local_overlay import LocalOverlay
 from streetjev.presentation.map_geometry import project, radius_degrees, unproject
+from streetjev.presentation.map_polygon import MapPolygon, geography_path
 from streetjev.presentation.map_scale import HeatScale, format_score, support_color
 from streetjev.presentation.scores import display_scores
 
@@ -17,11 +22,32 @@ class CountryOutline(QGraphicsPathItem):
         self.lines = [
             QLineF(a, b) for polygon in path.toSubpathPolygons() for a, b in zip(polygon, list(polygon)[1:])
         ]
+        overview = self.lines
+        if len(self.lines) > 512:
+            overview = []
+            for polygon in path.toSubpathPolygons():
+                if len(polygon) < 2:
+                    continue
+                points = list(LineString([(p.x(), p.y()) for p in polygon]).simplify(0.08).coords)
+                overview.extend(QLineF(*a, *b) for a, b in pairwise(points))
+        self.full = self.lines, self.batches(self.lines)
+        self.overview = (overview, self.batches(overview)) if overview is not self.lines else self.full
 
         self.color, self.width = QColor(), 1
         self.setPen(QPen(Qt.PenStyle.NoPen))
         self.setZValue(2)
         self.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
+        self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemUsesExtendedStyleOption)
+
+    @staticmethod
+    def batches(lines):
+        chunks = []
+        for start in range(0, len(lines), 128):
+            batch = lines[start : start + 128]
+            xs = [p for line in batch for p in (line.x1(), line.x2())]
+            ys = [p for line in batch for p in (line.y1(), line.y2())]
+            chunks.append((QRectF(min(xs), min(ys), max(xs) - min(xs), max(ys) - min(ys)), batch))
+        return chunks
 
     def shape(self):
         return QPainterPath()
@@ -34,7 +60,19 @@ class CountryOutline(QGraphicsPathItem):
         pen.setCosmetic(True)
         pen.setCapStyle(Qt.PenCapStyle.FlatCap)
         painter.setPen(pen)
-        painter.drawLines(self.lines)
+        # Дальние части многоконтурных стран не проходят через растеризатор при pan.
+        scale = max(abs(painter.worldTransform().m11()), 1e-9)
+        # Менее одного физического пикселя отклонения только у обзорной обводки;
+        # исходные полигоны и индекс сцены не перестраиваются при смене масштаба.
+        lines, chunks = self.overview if scale * painter.device().devicePixelRatioF() <= 12 else self.full
+        margin = (self.width + 2) / scale
+        exposed = option.exposedRect.adjusted(-margin, -margin, margin, margin)
+        if exposed.contains(self.boundingRect()):
+            painter.drawLines(lines)
+        else:
+            for bounds, batch in chunks:
+                if exposed.intersects(bounds.adjusted(-margin, -margin, margin, margin)):
+                    painter.drawLines(batch)
 
 
 class MapView(QGraphicsView):
@@ -51,6 +89,11 @@ class MapView(QGraphicsView):
         self.setScene(QGraphicsScene(self))
         self.setBackgroundBrush(QColor("#101e29"))
         self.setRenderHint(QPainter.RenderHint.Antialiasing)
+        self.interacting = False
+        self.navigation_timer = QTimer(self)
+        self.navigation_timer.setSingleShot(True)
+        self.navigation_timer.setInterval(140)
+        self.navigation_timer.timeout.connect(self.finish_navigation)
         self.setDragMode(QGraphicsView.DragMode.ScrollHandDrag)
         self.setTransformationAnchor(QGraphicsView.ViewportAnchor.AnchorUnderMouse)
         self.setFrameShape(QGraphicsView.Shape.NoFrame)
@@ -79,24 +122,8 @@ class MapView(QGraphicsView):
         self.country_outlines = {}
         for feature in geography["features"]:
             properties, geometry = feature["properties"], feature["geometry"]
-            polygons = [geometry["coordinates"]] if geometry["type"] == "Polygon" else geometry["coordinates"]
-            path = QPainterPath()
-            path.setFillRule(Qt.FillRule.OddEvenFill)
-            for polygon in polygons:
-                for ring in polygon:
-                    if not ring:
-                        continue
-                    path.moveTo(*project(*ring[0]))
-                    previous = ring[0][0]
-                    for point in ring[1:]:
-                        # Не рисуем линию через весь мир при пересечении антимеридиана.
-                        if abs(point[0] - previous) > 180:
-                            path.moveTo(*project(*point))
-                        else:
-                            path.lineTo(*project(*point))
-                        previous = point[0]
-                    path.closeSubpath()
-            item = QGraphicsPathItem(path)
+            path = geography_path(geometry)
+            item = MapPolygon(path)
             item.setData(0, properties["code"])
             item.setData(1, properties.get("country"))
             pen = QPen(QColor("#486071"), 0.55)
@@ -159,7 +186,7 @@ class MapView(QGraphicsView):
         key = (transform.m11(), transform.m22(), transform.dx(), transform.dy(), self.viewport().size(), marker)
         if key == self._label_key:
             return self._label_layout
-        occupied, layout = [], []
+        occupied, layout = {}, []
         viewport = QRectF(self.viewport().rect())
         visible = self.mapToScene(self.viewport().rect()).boundingRect()
         limit = max(8, min(60, self.viewport().width() * self.viewport().height() // 15000))
@@ -180,14 +207,20 @@ class MapView(QGraphicsView):
             point = QPointF(self.mapFromScene(QPointF(x, y)))
             origin = point + QPointF(4, -text.size().height() - 2)
             box = QRectF(origin, text.size()).adjusted(-10, -6, 10, 6)
+            cells = [
+                (col, row)
+                for col in range(math.floor(box.left() / 64), math.floor(box.right() / 64) + 1)
+                for row in range(math.floor(box.top() / 64), math.floor(box.bottom() / 64) + 1)
+            ]
             if (
                 not viewport.contains(box)
-                or any(box.intersects(previous) for previous in occupied)
+                or any(box.intersects(previous) for cell in cells for previous in occupied.get(cell, ()))
                 or marker is not None
                 and box.intersects(QRectF(marker.x() - 8, marker.y() - 8, 16, 16))
             ):
                 continue
-            occupied.append(box)
+            for cell in cells:
+                occupied.setdefault(cell, []).append(box)
             seen.add((kind, name))
             layout.append((point, origin, text, kind))
             if len(layout) >= limit:
@@ -239,8 +272,29 @@ class MapView(QGraphicsView):
         self.auto_fit = False
         factor = 1.2 if event.angleDelta().y() > 0 else 1 / 1.2
         if 0.7 < self.transform().m11() * factor < 400000:
+            self.begin_navigation()
             self.scale(factor, factor)
             self.viewport_changed.emit()
+
+    def begin_navigation(self):
+        if not self.interacting:
+            self.interacting = True
+            self.setRenderHint(QPainter.RenderHint.Antialiasing, False)
+        self.navigation_timer.start()
+
+    def finish_navigation(self):
+        self.interacting = False
+        self.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        self.viewport().update()
+
+    def mouseMoveEvent(self, event):
+        if (
+            event.buttons() & Qt.MouseButton.LeftButton
+            and self._map_press is not None
+            and (event.position().toPoint() - self._map_press).manhattanLength() > 4
+        ):
+            self.begin_navigation()
+        super().mouseMoveEvent(event)
 
     def mouseDoubleClickEvent(self, event):
         if self.answer_mode:

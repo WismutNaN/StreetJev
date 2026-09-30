@@ -6,11 +6,12 @@ from collections import OrderedDict
 
 from PySide6.QtCore import QObject, QRunnable, Qt, QThreadPool, QTimer, Signal
 from PySide6.QtGui import QColor, QPainterPath, QPen
-from PySide6.QtWidgets import QGraphicsPathItem, QLabel
+from PySide6.QtWidgets import QLabel
 
 from streetjev.domain.subregions import subregion_support
 from streetjev.infrastructure.subregions import SubregionRepository
 from streetjev.presentation.map_geometry import project, unproject
+from streetjev.presentation.map_polygon import MapPolygon
 from streetjev.presentation.map_scale import HeatScale, format_score, support_color
 from streetjev.presentation.scores import display_scores
 
@@ -156,7 +157,7 @@ class SubregionLayer(QObject):
             if code in self.items:
                 continue
             path = self.path(code, dataset, lod)
-            item = QGraphicsPathItem(path)
+            item = MapPolygon(path)
             item.setData(0, code)
             item.setData(1, dataset.country)
             item.setData(2, lod)
