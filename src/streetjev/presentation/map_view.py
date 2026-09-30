@@ -1,4 +1,4 @@
-from PySide6.QtCore import QEvent, QPointF, QRectF, Qt, Signal
+from PySide6.QtCore import QEvent, QLineF, QPointF, QRectF, Qt, Signal
 from PySide6.QtGui import QBrush, QColor, QFont, QPainter, QPainterPath, QPen, QStaticText
 from PySide6.QtWidgets import QGraphicsItem, QGraphicsPathItem, QGraphicsScene, QGraphicsView, QToolTip
 
@@ -14,6 +14,10 @@ from streetjev.presentation.scores import display_scores
 class CountryOutline(QGraphicsPathItem):
     def __init__(self, path):
         super().__init__(path)
+        self.lines = [
+            QLineF(a, b) for polygon in path.toSubpathPolygons() for a, b in zip(polygon, list(polygon)[1:])
+        ]
+
         self.color, self.width = QColor(), 1
         self.setPen(QPen(Qt.PenStyle.NoPen))
         self.setZValue(2)
@@ -23,14 +27,14 @@ class CountryOutline(QGraphicsPathItem):
         return QPainterPath()
 
     def paint(self, painter, option, widget=None):
-        path = self.path()
-        painter.setClipPath(path, Qt.ClipOperation.IntersectClip)
         painter.setBrush(Qt.BrushStyle.NoBrush)
-        for color, width in ((QColor(16, 30, 41, 180), self.width + 2), (self.color, self.width)):
-            pen = QPen(color, width)
-            pen.setCosmetic(True)
-            painter.setPen(pen)
-            painter.drawPath(path)
+        # Кэшируем сегменты: Qt строит дорогую геометрию соединений для широкого drawPath.
+        # drawLines не пересобирает её и использует только прямоугольное отсечение viewport.
+        pen = QPen(self.color, self.width / 2)
+        pen.setCosmetic(True)
+        pen.setCapStyle(Qt.PenCapStyle.FlatCap)
+        painter.setPen(pen)
+        painter.drawLines(self.lines)
 
 
 class MapView(QGraphicsView):
@@ -433,6 +437,7 @@ class MapView(QGraphicsView):
                 outline.color = support_color(intensity)
                 outline.color.setAlphaF(0.25 + 0.6 * intensity)
                 outline.width = 2 * (0.55 + 1.8 * intensity**0.5)
+                outline.setZValue(2 + intensity)
                 outline.update()
             pen = QPen(QColor("#365061"), 0.45 if country else 0.55)
             pen.setCosmetic(True)

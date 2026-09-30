@@ -1,6 +1,6 @@
 """Локальные совпадения: один кэшируемый прозрачный слой вместо сотен scene items."""
 
-from PySide6.QtCore import QPointF, QRectF, Qt
+from PySide6.QtCore import QPointF, QRectF, QSize, Qt
 from PySide6.QtGui import QColor, QFont, QImage, QPainter, QPainterPath, QPen
 from PySide6.QtWidgets import QGraphicsItem
 
@@ -14,6 +14,7 @@ class LocalOverlay(QGraphicsItem):
         self.view = view
         self.points = ()
         self.clusters = ()
+        self.markers = ()
         self.radius_km = 20
         self.mode = "relative"
         self.bucket = None
@@ -49,6 +50,15 @@ class LocalOverlay(QGraphicsItem):
             self.scale = HeatScale.from_scores(
                 [0, *(p.mass for p in self.clusters)] if self.clusters else [], self.mode
             )
+            self.markers = tuple(
+                (
+                    group,
+                    radius_degrees(group.points[0].latitude, 1) if len(group.points) == 1 else 0,
+                    support_color(self.scale.intensity(group.mass)),
+                    self.scale.intensity(group.mass),
+                )
+                for group in self.clusters
+            )
             self.bucket = bucket
             self.image_key = None
 
@@ -83,63 +93,96 @@ class LocalOverlay(QGraphicsItem):
         image.fill(Qt.GlobalColor.transparent)
         self.image = image
         viewport = QRectF(0, 0, size.width(), size.height())
-        for cluster in self.clusters:
-            radius = (
-                radius_degrees(cluster.points[0].latitude, self.radius_km) * transform.m11()
-                if len(cluster.points) == 1
-                else 0
-            )
+        colors, intensities = [], []
+        sx, sy, dx, dy = transform.m11(), transform.m22(), transform.dx(), transform.dy()
+        width, height = size.width(), size.height()
+        for cluster, radius_unit, color, intensity in self.markers:
+            radius = radius_unit * self.radius_km * sx
+            extent = max(radius, 14)
+            y = cluster.y * sy + dy
+            if y + extent < 0 or y - extent > height:
+                continue
             # При пересечении антимеридиана видна и вторая часть области поиска.
             for offset in (-360, 0, 360):
-                center = transform.map(QPointF(cluster.x + offset, cluster.y))
-                extent = max(radius, 14)
-                if viewport.intersects(QRectF(center.x() - extent, center.y() - extent, 2 * extent, 2 * extent)):
-                    self.visible_markers.append((center, cluster, radius))
-        # Непрозрачные фигуры сначала компонуются отдельно, затем весь слой получает alpha.
-        # Пересечение кругов не суммирует непрозрачность и не изображает рост уверенности.
-        halos = QImage(image.size(), image.format())
-        halos.setDevicePixelRatio(ratio)
+                x = (cluster.x + offset) * sx + dx
+                if x + extent >= 0 and x - extent <= width:
+                    self.visible_markers.append((QPointF(x, y), cluster, radius))
+                    colors.append(color)
+                    intensities.append(intensity)
+        # Круги — мягкий ориентир поиска. Ограничиваем размер их растра независимо от
+        # DPI/zoom; точные маркеры рисуются далее в полном разрешении. Иначе сотни
+        # перекрывающихся кругов заново заполняют миллиарды пикселей при каждом pan.
+        circle_count = sum(radius >= 8 for _, _, radius in self.visible_markers)
+        raster_limit = max(256, 640 / max(1, (circle_count / 128) ** 0.5))
+        sharp_circles = 0 < circle_count <= 64 and max(r for _, _, r in self.visible_markers) <= 128
+        raster_scale = ratio if sharp_circles else min(ratio, raster_limit / max(size.width(), size.height()))
+        raster_size = QSize(
+            max(1, round(size.width() * raster_scale)), max(1, round(size.height() * raster_scale))
+        )
+        halos = QImage(raster_size, image.format())
         halos.fill(Qt.GlobalColor.transparent)
         brush = QPainter(halos)
-        brush.setRenderHint(QPainter.RenderHint.Antialiasing)
+        brush.scale(raster_scale, raster_scale)
+        brush.setRenderHint(QPainter.RenderHint.Antialiasing, sharp_circles)
         brush.setPen(Qt.PenStyle.NoPen)
 
         def covers_view(center, radius):
-            return radius**2 >= max(
-                (center.x() - x) ** 2 + (center.y() - y) ** 2
-                for x in (0, size.width())
-                for y in (0, size.height())
+            return radius**2 >= max(center.x() ** 2, (center.x() - width) ** 2) + max(
+                center.y() ** 2, (center.y() - height) ** 2
             )
 
-        for center, cluster, radius in self.visible_markers:
+        # Последний круг, целиком покрывающий viewport, полностью скрывает заливки
+        # слабее себя. Их можно пропустить без изменения итоговых цветов.
+        first_halo = 0
+        covers = []
+        for i, (center, _, radius) in enumerate(self.visible_markers):
+            covered = radius >= 8 and covers_view(center, radius)
+            covers.append(covered)
+            if covered:
+                first_halo = i
+        for i in range(first_halo, len(self.visible_markers)):
+            center, _, radius = self.visible_markers[i]
             if radius >= 8:
-                brush.setBrush(support_color(self.scale.intensity(cluster.mass)))
-                if covers_view(center, radius):
+                brush.setBrush(colors[i])
+                if covers[i]:
                     brush.drawRect(viewport)
                 else:
                     brush.drawEllipse(center, radius, radius)
         brush.end()
+        circles = QImage(raster_size, image.format())
+        circles.fill(Qt.GlobalColor.transparent)
+        brush = QPainter(circles)
+        brush.setOpacity(0.15)
+        brush.drawImage(QPointF(), halos)
+        brush.setOpacity(1)
+        brush.scale(raster_scale, raster_scale)
+        brush.setRenderHint(QPainter.RenderHint.Antialiasing, sharp_circles)
+        brush.setBrush(Qt.BrushStyle.NoBrush)
+        for i, (center, _, radius) in enumerate(self.visible_markers):
+            if radius >= 8 and not covers[i]:
+                ring = QColor(colors[i])
+                # Один пиксель малого растра, с поправкой яркости на его увеличение.
+                # Финальное плавное увеличение сглаживает круг; точкам оно не нужно.
+                ring.setAlphaF(0.8 if sharp_circles else 0.8 * min(1, raster_scale))
+                brush.setPen(QPen(ring, 1 if sharp_circles else 0))
+                brush.drawEllipse(center, radius, radius)
+        brush.end()
         painter = QPainter(image)
+        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+        painter.drawImage(viewport, circles)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        painter.setOpacity(0.15)
-        painter.drawImage(QPointF(), halos)
-        painter.setOpacity(1)
         font = QFont("Segoe UI")
         font.setPixelSize(11)
         painter.setFont(font)
-        for center, cluster, radius in self.visible_markers:
-            intensity = self.scale.intensity(cluster.mass)
-            color = support_color(intensity)
-            if radius >= 8 and not covers_view(center, radius):
-                ring = QColor(color)
-                ring.setAlphaF(0.8)
-                painter.setPen(QPen(ring, 1.1))
-                painter.setBrush(Qt.BrushStyle.NoBrush)
-                painter.drawEllipse(center, radius, radius)
+        marker_bounds = viewport.adjusted(-14, -14, 14, 14)
+        for i, (center, cluster, _) in enumerate(self.visible_markers):
+            if not marker_bounds.contains(center):
+                continue
+            intensity = intensities[i]
             count = len(cluster.points)
             dot_radius = 10 if count > 1 else 3.6 + 1.8 * intensity
             painter.setPen(QPen(QColor("#101e29"), 2))
-            painter.setBrush(color)
+            painter.setBrush(colors[i])
             painter.drawEllipse(center, dot_radius, dot_radius)
             if count > 1:
                 painter.setPen(QColor("#101e29" if intensity >= 0.3 else "#e0ebed"))
