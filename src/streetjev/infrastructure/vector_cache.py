@@ -34,7 +34,7 @@ def expires_at(headers, now=None):
 
 class VectorCache:
     def __init__(self, root):
-        self.root = Path(root) / "geometry-v2"
+        self.root = Path(root) / "geometry-v3"
         self.last_prune = 0.0
 
     def path(self, url):
@@ -44,7 +44,13 @@ class VectorCache:
         try:
             with gzip.open(self.path(url), "rt", encoding="utf-8") as stream:
                 saved = json.load(stream)
-            if saved["expires"] > time.time() and set(saved["details"]) == {"roads", "labels"}:
+            if saved["expires"] > time.time() and set(saved["details"]) == {
+                "roads",
+                "labels",
+                "water",
+                "rivers",
+                "landmarks",
+            }:
                 return saved["details"], saved["expires"]
         except (OSError, ValueError, KeyError, TypeError, EOFError):
             pass

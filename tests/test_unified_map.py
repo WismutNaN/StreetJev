@@ -7,6 +7,7 @@ from streetjev.domain.clues import PlaceClues, apply_clues
 from streetjev.domain.evidence import Distribution
 from streetjev.domain.localization import LocalPoint, combine_points, local_scores
 from streetjev.domain.round import GeoRound
+from streetjev.domain.subregions import Subregion
 from streetjev.presentation.map_geometry import cluster_points, project, unproject, zoom_bucket
 from streetjev.presentation.ranking import ranked_places, row_score
 from streetjev.presentation.scores import display_scores
@@ -65,3 +66,18 @@ def test_hierarchy_has_all_levels_and_missing_local_last_frame(catalog):
     state.accept(state.id, frame(255, "new"), evidence(), 1)
     assert row_score(rows[2], display_scores(state.snapshot(), "last")) is None
     assert row_score(rows[2], display_scores(state.snapshot())) == pytest.approx(0.15)
+
+
+def test_hierarchy_includes_real_admin2_and_keeps_missing_evidence_unknown(catalog):
+    state = GeoRound(catalog)
+    point = LocalPoint("a", 47.2692, 11.4041, "AT", "AT-7", 0.3)
+    sample = replace(evidence(at=0.8, regions={"AT": Distribution({"AT-7": 0.8, "AT-5": 0.2})}), points=(point,))
+    state.accept(state.id, frame(), sample, 1)
+    scores = display_scores(state.snapshot())
+    places = {"district": Subregion("district", "Innsbruck-Stadt", "AT", "AT-7")}
+    rows = ranked_places(catalog, scores, places, {"district": 0.3}, {point.code: "district"})
+    assert [row.kind for row in rows[:4]] == ["country", "region", "subregion", "point"]
+    assert rows[2].label.strip() == "Innsbruck-Stadt"
+    assert row_score(rows[2], scores, {"district": 0.3}) == 0.3
+    assert row_score(rows[2], scores, {}) is None
+    assert not any(row.kind == "subregion" for row in ranked_places(catalog, scores, places, {}))

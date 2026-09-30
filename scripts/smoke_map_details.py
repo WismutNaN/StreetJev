@@ -60,6 +60,30 @@ def main():
                     {"geometry": "POLYGON((0 0,4096 0,4096 4096,0 4096,0 0))", "properties": {"kind": "forest"}}
                 ],
             },
+            {
+                "name": "water_polygons",
+                "features": [
+                    {
+                        "geometry": "POLYGON((2700 300,3900 300,3900 1500,2700 1500,2700 300))",
+                        "properties": {"kind": "water", "way_area": 5000000},
+                    }
+                ],
+            },
+            {
+                "name": "water_polygons_labels",
+                "features": [
+                    {
+                        "geometry": "POINT(3300 900)",
+                        "properties": {"kind": "water", "name": "See", "name_ru": "Озеро"},
+                    }
+                ],
+            },
+            {
+                "name": "street_labels",
+                "features": [
+                    {"geometry": "LINESTRING(0 1200,4096 3000)", "properties": {"kind": "primary", "ref": "A12"}}
+                ],
+            },
         ],
         default_options={"y_coord_down": True},
     )
@@ -137,6 +161,9 @@ def main():
             pump(lambda: len(window.tiles.items) == len(window.tiles.wanted) and bool(window.map.detail_labels))
             assert window.map.detail_active
             assert window.map.detail_labels
+            assert any(label[-1] == "water" and label[2] == "Озеро / See" for label in window.map.detail_labels)
+            assert any(label[-1] == "road" and label[2] == "A12" for label in window.map.detail_labels)
+            assert any(not item.water.isEmpty() for item in window.tiles.items.values())
             assert fills == {code: item.brush().color().rgba() for code, item in window.map.items_by_code.items()}
             assert window.map.local_overlay.points == local_points
             assert all(not hasattr(item, "pixmap") for item in window.tiles.items.values())

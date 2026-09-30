@@ -18,6 +18,7 @@ def test_cache_freshness_uses_date_age_and_server_revalidation():
 def test_prepared_cache_restart_expiration_source_and_corruption(tmp_path):
     cache = VectorCache(tmp_path)
     details = {"roads": [[True, [[0, 0], [1, 1]]]], "labels": [[0.5, 0.5, "Город", 123]]}
+    details.update(water=[], rivers=[], landmarks=[])
     url = "https://example.test/14/200/300.mvt"
     expiry = time.time() + 100
     cache.write(url, details, expiry)

@@ -23,6 +23,7 @@ def download(name):
 
 def build():
     features, codes, adm_to_code = [], set(), {}
+    iso3 = {}
     countries = download("ne_50m_admin_0_countries.geojson")
     grouped = {}
     for f in countries["features"]:
@@ -31,6 +32,8 @@ def build():
         if code in ("-99", ""):
             code = p["ADM0_A3"]
         adm_to_code[p["ADM0_A3"]] = code
+        iso = p.get("ISO_A3_EH")
+        iso3[code] = p["ADM0_A3"] if iso in ("-99", "", None) else iso
         grouped.setdefault(code, []).append(f)
     for code, group in grouped.items():
         # Natural Earth хранит некоторые зависимые острова отдельными features с общим ISO-кодом.
@@ -67,6 +70,9 @@ def build():
         )
     target = ROOT / "src/streetjev/assets/geography.json"
     target.parent.mkdir(parents=True, exist_ok=True)
+    (target.parent / "country_iso3.json").write_text(
+        json.dumps(iso3, sort_keys=True, indent=2) + "\n", encoding="utf-8"
+    )
     data = {"type": "FeatureCollection", "source": "Natural Earth", "revision": REVISION, "features": features}
 
     # Координаты до 4 знаков: для обзорной карты точнее не требуется.

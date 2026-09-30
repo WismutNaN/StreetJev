@@ -8,7 +8,7 @@ from streetjev.infrastructure.map_tiles import DEFAULT_TILE_URL, TileClient, vis
 
 
 class RoadTile(QGraphicsItem):
-    """Только линии. Нет фоновой заливки, полигонов land/water/buildings и цветного стиля OSM."""
+    """Дороги и вода без растительности, рельефа, зданий и POI."""
 
     def __init__(self, key, details):
         super().__init__()
@@ -18,14 +18,35 @@ class RoadTile(QGraphicsItem):
         left, top = -180 + x * size, -180 + y * size
         self.rectangle = QRectF(left, top, size, size)
         self.paths = (QPainterPath(), QPainterPath())
+        self.water, self.rivers = QPainterPath(), QPainterPath()
+        self.water.setFillRule(Qt.FillRule.OddEvenFill)
+        for polygon in details.get("water", ()):
+            for ring in polygon:
+                if not ring:
+                    continue
+                self.water.moveTo(left + ring[0][0] * size, top + ring[0][1] * size)
+                for px, py in ring[1:]:
+                    self.water.lineTo(left + px * size, top + py * size)
+                self.water.closeSubpath()
+        for line in details.get("rivers", ()):
+            if not line:
+                continue
+            self.rivers.moveTo(left + line[0][0] * size, top + line[0][1] * size)
+            for px, py in line[1:]:
+                self.rivers.lineTo(left + px * size, top + py * size)
         for major, points in details["roads"]:
             path = self.paths[int(major)]
             path.moveTo(left + points[0][0] * size, top + points[0][1] * size)
             for px, py in points[1:]:
                 path.lineTo(left + px * size, top + py * size)
         self.labels = [
-            (left + x * size, top + y * size, name, population) for x, y, name, population in details["labels"]
+            (left + x * size, top + y * size, name, population, "place")
+            for x, y, name, population in details["labels"]
         ]
+        self.labels.extend(
+            (left + x * size, top + y * size, name, priority, kind)
+            for x, y, name, priority, kind in details.get("landmarks", ())
+        )
         self.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
         self.setZValue(4)
 
@@ -37,7 +58,14 @@ class RoadTile(QGraphicsItem):
 
     def paint(self, painter, option, widget=None):
         painter.setClipRect(self.rectangle, Qt.ClipOperation.IntersectClip)
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QColor("#243f50"))
+        painter.drawPath(self.water)
         painter.setBrush(Qt.BrushStyle.NoBrush)
+        pen = QPen(QColor(98, 156, 181, 150), 0.75)
+        pen.setCosmetic(True)
+        painter.setPen(pen)
+        painter.drawPath(self.rivers)
         for major, path in enumerate(self.paths):
             # Ориентиры остаются второстепенными на любом цвете тепловой карты.
             color = QColor(135, 151, 160, 95 if major else 55)
@@ -135,13 +163,13 @@ class TileLayer(QObject):
         self.view.set_detail_active(True)
         self.credit.setText(self.credit_text)
         self.position_credit()
-        self.credit.setToolTip("Векторные дороги и населённые пункты · OpenStreetMap")
+        self.credit.setToolTip("Дороги, населённые пункты, реки и озёра · OpenStreetMap")
 
     def update_labels(self):
         unique = {
-            (round(x, 7), round(y, 7), name): (x, y, name, population)
+            (round(x, 7), round(y, 7), name): (x, y, name, population, kind)
             for key, item in sorted(self.items.items(), key=lambda entry: entry[0] in self.wanted)
-            for x, y, name, population in item.labels
+            for x, y, name, population, kind in item.labels
         }
         self.view.set_detail_labels(sorted(unique.values(), key=lambda item: item[3], reverse=True))
 

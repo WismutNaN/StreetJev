@@ -135,11 +135,17 @@ class MainWindow(QMainWindow):
         caption = self.catalog.countries[country].label
         if region:
             caption += " · " + self.catalog.regions[region].label
+        dataset = self.subregions.datasets.get(country)
+        if dataset:
+            code = dataset.locate(latitude, longitude)
+            if code:
+                caption += " · " + dataset.by_code[code].name
         self.answer_button.setToolTip(f"{caption}\n{latitude:.5f}, {longitude:.5f}\nНажмите, чтобы исправить")
         self.map.show_answer(truth)
         self.status.setText(f"Сохранено: {caption}. «Сброс» — следующий раунд")
 
     def mode_changed(self):
+        self.subregions.enabled = not self.demo.isChecked()
         self.auto.setChecked(False)
         self.chip_enabled.setChecked(False)
         self.reset_round()
@@ -384,24 +390,38 @@ class MainWindow(QMainWindow):
         self.agreement.setToolTip(
             "В скольких кадрах лидер раунда был первым. Это не вероятность правильного ответа."
         )
+        self.update_ranking()
+
+    def update_ranking(self):
+        snapshot = self.session.round.snapshot()
         selected = display_scores(snapshot, self.map.source)
-        rows = ranked_places(self.catalog, selected)
+        rows = ranked_places(
+            self.catalog, selected, self.subregions.places, self.subregions.support, self.subregions.assignments
+        )
         self.ranking.setRowCount(len(rows))
         self.sidebar.setVisible(selected.active or not self.preview.isHidden())
         self.fit_side_panel()
         sources = {source: display_scores(snapshot, source) for source in ("round", "last")}
+        local_scores = {source: self.subregions.projection(scores)[0] for source, scores in sources.items()}
         for row, entry in enumerate(rows):
             item = QTableWidgetItem(entry.label)
             item.setData(Qt.ItemDataRole.UserRole, (entry.kind, entry.code))
             item.setToolTip(
-                "Двойной клик — приблизить" + ("\nКоординаты совпадения Chipoint" if entry.kind == "point" else "")
+                entry.label.strip()
+                + "\nДвойной клик — приблизить"
+                + ("\nКоординаты совпадения Chipoint" if entry.kind == "point" else "")
+                + (
+                    "\nАдминистративный подрегион ADM2 · поддержка точек Chipoint"
+                    if entry.kind == "subregion"
+                    else ""
+                )
             )
             font = item.font()
             font.setBold(entry.kind == "country")
             item.setFont(font)
             self.ranking.setItem(row, 0, item)
             for column, source in ((1, "round"), (2, "last")):
-                value = row_score(entry, sources[source])
+                value = row_score(entry, sources[source], local_scores[source])
                 self.ranking.setItem(
                     row, column, QTableWidgetItem(format_score(value) if value is not None else "—")
                 )
@@ -490,6 +510,18 @@ class MainWindow(QMainWindow):
 
                 data["calibration_profile"] = asdict(self.profile) if self.profile.imajev_models else None
                 data["ground_truth"] = asdict(self.session.truth) if self.session.truth else None
+                support, _ = self.subregions.projection(display_scores(self.session.round.snapshot()))
+                data["subregions"] = {
+                    code: {**asdict(self.subregions.places[code]), "support": mass}
+                    for code, mass in support.items()
+                }
+                data["subregion_sources"] = {c: d.metadata for c, d in self.subregions.datasets.items()}
+                if self.session.truth:
+                    truth = self.session.truth
+                    dataset = self.subregions.datasets.get(truth.country)
+                    data["ground_truth"]["subregion"] = (
+                        dataset.locate(truth.latitude, truth.longitude) if dataset else None
+                    )
                 data["chipoint_enabled"] = self.chip_enabled.isChecked()
                 data["fusion"] = "linear_experts_v2" if self.chip_enabled.isChecked() else None
                 Path(path).write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -507,6 +539,7 @@ class MainWindow(QMainWindow):
             return
         self.hotkeys.close()
         self.tiles.close()
+        self.subregions.close()
         self.closing = True
         self.chip_generation += 1
         for name, value in {

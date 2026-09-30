@@ -118,7 +118,7 @@ def build_window(w, geography, demo):
     view.addWidget(button("Лидер", w.focus_leader))
     w.details = QCheckBox("Детали")
     w.details.setToolTip(
-        "Нейтральные векторные дороги и названия населённых пунктов. Нужен интернет; данные кэшируются"
+        "Дороги, города, реки и озёра. Русское + местное название, если есть в данных. Интернет и локальный кэш"
     )
     view.addWidget(w.details)
     root.addLayout(view)
@@ -132,6 +132,10 @@ def build_window(w, geography, demo):
     w.tiles = TileLayer(
         w.map, w.data_dir / "map-vector-cache", template=str(w.settings.value("map_vector_url", DEFAULT_TILE_URL))
     )
+    from streetjev.presentation.subregion_layer import SubregionLayer
+
+    w.subregions = SubregionLayer(w.map, w.data_dir / "boundaries", geography, enabled=not demo)
+    w.subregions.changed.connect(w.update_ranking)
     w.details.toggled.connect(w.tiles.set_enabled)
     w.details.setChecked(str(w.settings.value("map_details", "true")).lower() == "true" and not demo)
     w.map.answer_clicked.connect(w.save_answer)
@@ -181,7 +185,7 @@ def build_window(w, geography, demo):
     w.status.setMinimumWidth(160)
     w.status.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
     footer.addWidget(w.status, 1)
-    footer.addWidget(label("Контур: страна · Заливка: регион · Точки: Chipoint"))
+    footer.addWidget(label("Контур: страна · Заливка: регион/район · Точки: Chipoint"))
     w.scale_caption = label()
     w.scale_caption.setMaximumWidth(140)
     footer.addWidget(w.scale_caption)
@@ -191,7 +195,8 @@ def build_window(w, geography, demo):
         dot.setAlignment(Qt.AlignmentFlag.AlignCenter)
         dot.setMinimumWidth(32)
         dot.setToolTip(
-            "Цвет сравнивает поддержку внутри каждого уровня. Точные оценки — в таблице и подсказках. Границы: Natural Earth."
+            "Цвет сравнивает поддержку внутри каждого уровня. ADM0/1: Natural Earth; ADM2: geoBoundaries. "
+            "Районы появляются при приближении; их оценки — только по точкам Chipoint."
         )
         w.legend_labels.append(dot)
         footer.addWidget(dot)

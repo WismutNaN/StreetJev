@@ -43,6 +43,7 @@ class MapView(QGraphicsView):
     scale_changed = Signal(object)
     manual_navigation = Signal()
     location_selected = Signal(str)
+    snapshot_changed = Signal()
 
     def __init__(self, catalog: GeoCatalog, geography: dict):
         super().__init__()
@@ -69,6 +70,7 @@ class MapView(QGraphicsView):
         self.detail_active = False
         self.detail_labels = []
         self.country_labels = []
+        self.subregion_labels = []
         self._label_key = None
         self._label_layout = []
         self._label_texts = {}
@@ -147,7 +149,7 @@ class MapView(QGraphicsView):
     def set_detail_labels(self, labels):
         self.detail_labels = labels
         self._label_key = None
-        names = {item[2] for item in [*labels, *self.country_labels]}
+        names = {item[2] for item in [*labels, *self.country_labels, *self.subregion_labels]}
         self._label_texts = {name: text for name, text in self._label_texts.items() if name in names}
         self.viewport().update()
 
@@ -160,8 +162,13 @@ class MapView(QGraphicsView):
         occupied, layout = [], []
         viewport = QRectF(self.viewport().rect())
         visible = self.mapToScene(self.viewport().rect()).boundingRect()
-        limit = max(6, min(32, self.viewport().width() * self.viewport().height() // 22000))
-        for x, y, name, _population in [*self.country_labels, *self.detail_labels]:
+        limit = max(8, min(60, self.viewport().width() * self.viewport().height() // 15000))
+        seen = set()
+        for label in [*self.country_labels, *self.subregion_labels, *self.detail_labels]:
+            x, y, name, _population = label[:4]
+            kind = label[4] if len(label) > 4 else "place"
+            if kind != "place" and (kind, name) in seen:
+                continue
             if not visible.contains(QPointF(x, y)):
                 continue
             text = self._label_texts.get(name)
@@ -172,7 +179,7 @@ class MapView(QGraphicsView):
                 self._label_texts[name] = text
             point = QPointF(self.mapFromScene(QPointF(x, y)))
             origin = point + QPointF(4, -text.size().height() - 2)
-            box = QRectF(origin, text.size()).adjusted(-18, -9, 18, 9)
+            box = QRectF(origin, text.size()).adjusted(-10, -6, 10, 6)
             if (
                 not viewport.contains(box)
                 or any(box.intersects(previous) for previous in occupied)
@@ -181,7 +188,8 @@ class MapView(QGraphicsView):
             ):
                 continue
             occupied.append(box)
-            layout.append((point, origin, text))
+            seen.add((kind, name))
+            layout.append((point, origin, text, kind))
             if len(layout) >= limit:
                 break
         self._label_key, self._label_layout = key, layout
@@ -189,19 +197,26 @@ class MapView(QGraphicsView):
 
     def drawForeground(self, painter, rect):
         super().drawForeground(painter, rect)
-        if not self.detail_labels and not self.country_labels:
+        if not self.detail_labels and not self.country_labels and not self.subregion_labels:
             return
         painter.save()
         painter.resetTransform()
         painter.setFont(self._label_font)
-        for point, origin, text in self.detail_label_layout():
+        for point, origin, text, kind in self.detail_label_layout():
             painter.setPen(QColor(12, 22, 29, 180))
             painter.drawStaticText(origin + QPointF(0, 1), text)
-            painter.setPen(QColor(165, 179, 188, 210))
+            painter.setPen(
+                QColor("#84b5ce")
+                if kind == "water"
+                else QColor("#a5afb8")
+                if kind == "road"
+                else QColor("#c4cdd3")
+            )
             painter.drawStaticText(origin, text)
-            painter.setPen(Qt.PenStyle.NoPen)
-            painter.setBrush(QColor(150, 164, 173, 170))
-            painter.drawEllipse(point, 1.2, 1.2)
+            if kind == "place":
+                painter.setPen(Qt.PenStyle.NoPen)
+                painter.setBrush(QColor(150, 164, 173, 170))
+                painter.drawEllipse(point, 1.2, 1.2)
         painter.restore()
 
     def show_world(self):
@@ -323,7 +338,9 @@ class MapView(QGraphicsView):
         return "\n".join(lines)
 
     def focus_place(self, code):
-        if code in self.country_bounds:
+        if hasattr(self, "subregions") and code in self.subregions.places:
+            self.subregions.focus(code)
+        elif code in self.country_bounds:
             self.focus_country(code)
         elif code in self.items_by_code:
             self.auto_fit = False
@@ -458,10 +475,11 @@ class MapView(QGraphicsView):
                     )
                 )
         self._label_key = None
-        names = {item[2] for item in [*self.detail_labels, *self.country_labels]}
+        names = {item[2] for item in [*self.detail_labels, *self.country_labels, *self.subregion_labels]}
         self._label_texts = {name: text for name, text in self._label_texts.items() if name in names}
         self.local_overlay.set_points(scores.points if active else (), self.scale_mode)
         self.local_overlay.image_key = None
         self.local_overlay.update()
         self.scale_changed.emit(self.heat_scale)
+        self.snapshot_changed.emit()
         self.viewport().update()
