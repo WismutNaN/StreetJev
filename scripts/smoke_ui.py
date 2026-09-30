@@ -55,7 +55,6 @@ def main():
     assert window.session.round.snapshot().countries == saved_scores
     window.score_source.setCurrentIndex(0)
     window.color_scale.setCurrentIndex(0)
-    window.level.setCurrentIndex(1)
     window.map.focus_country("AT")
     app.processEvents()
     window.grab().save(str(output / "regions.png"))
@@ -86,14 +85,14 @@ def main():
     highest_region = max(
         window.session.round.snapshot().last_regions, key=window.session.round.snapshot().last_regions.get
     )
-    assert window.map.items_by_code[highest_region].brush().color().name() == "#fb6f50"
-    assert window.map.items_by_code["DE"].brush().color().name() == "#192a37"
+    assert window.map.items_by_code[highest_region].brush().color().name() == "#f18b57"
+    assert window.map.items_by_code["DE"].brush().color().name() == "#1a2d3b"
     before_zoom = window.map.heat_scale
     window.map.focus_country("AT")
     assert window.map.heat_scale == before_zoom
     window.grab().save(str(output / "low-regions.png"))
     window.color_scale.setCurrentIndex(1)
-    assert window.map.items_by_code[highest_region].brush().color().name() != "#fb6f50"
+    assert window.map.items_by_code[highest_region].brush().color().name() != "#f18b57"
     window.grab().save(str(output / "low-regions-absolute.png"))
     window.color_scale.setCurrentIndex(0)
     window.resize(1000, 600)

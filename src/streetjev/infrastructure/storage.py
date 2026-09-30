@@ -30,6 +30,7 @@ def evidence_json(evidence: GeoEvidence) -> str:
                 for k, v in evidence.clues.items()
             },
             "cells": [asdict(cell) for cell in evidence.cells],
+            "points": [asdict(point) for point in evidence.points],
         },
         ensure_ascii=False,
     )

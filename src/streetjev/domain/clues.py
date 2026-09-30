@@ -57,4 +57,17 @@ def apply_clues(
             )
             for cell in evidence.cells
         ),
+        points=tuple(
+            replace(
+                point,
+                mass=point.mass
+                * compatibility(
+                    facts.get(point.country, PlaceClues()), clues, driving_strength, hemisphere_strength
+                )
+                * compatibility(
+                    facts.get(point.region, PlaceClues()), clues, driving_strength, hemisphere_strength
+                ),
+            )
+            for point in evidence.points
+        ),
     )

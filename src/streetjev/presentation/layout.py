@@ -99,10 +99,6 @@ def build_window(w, geography, demo):
     w.mode_badge = label("", "eyebrow")
     view.addWidget(w.mode_badge)
     view.addStretch()
-    w.level = QComboBox()
-    w.level.addItems(["Страны", "Регионы", "Зоны · 10 км"])
-    w.level.setToolTip("Зоны — участки поиска по координатам Chipoint, не административные районы")
-    w.level.currentIndexChanged.connect(w.level_changed)
     w.score_source = QComboBox()
     w.score_source.addItems(["Раунд", "Кадр"])
     w.score_source.setToolTip("Источник оценок карты и порядок таблицы")
@@ -116,7 +112,7 @@ def build_window(w, geography, demo):
         "Приближать согласованную группу лидеров. При разбросе по миру — вся карта. Ручное перемещение приостанавливает автофокус."
     )
     w.auto_focus.setChecked(True)
-    for widget in (w.level, w.score_source, w.color_scale, w.auto_focus):
+    for widget in (w.score_source, w.color_scale, w.auto_focus):
         view.addWidget(widget)
     view.addWidget(button("Мир", w.show_world))
     view.addWidget(button("Лидер", w.focus_leader))
@@ -139,7 +135,7 @@ def build_window(w, geography, demo):
     w.details.toggled.connect(w.tiles.set_enabled)
     w.details.setChecked(str(w.settings.value("map_details", "true")).lower() == "true" and not demo)
     w.map.answer_clicked.connect(w.save_answer)
-    w.map.country_clicked.connect(lambda _: w.level.setCurrentIndex(1))
+    w.map.location_selected.connect(w.show_location_details)
     w.map.manual_navigation.connect(lambda: w.auto_focus.setChecked(False))
     w.auto_focus.toggled.connect(w.auto_focus_changed)
     canvas_layout.addWidget(w.map, 0, 0)
@@ -185,16 +181,17 @@ def build_window(w, geography, demo):
     w.status.setMinimumWidth(160)
     w.status.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
     footer.addWidget(w.status, 1)
+    footer.addWidget(label("Контур: страна · Заливка: регион · Точки: Chipoint"))
     w.scale_caption = label()
     w.scale_caption.setMaximumWidth(140)
     footer.addWidget(w.scale_caption)
     w.legend_labels = []
-    for _ in range(6):
+    for _ in range(5):
         dot = label()
         dot.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        dot.setMinimumWidth(58)
+        dot.setMinimumWidth(32)
         dot.setToolTip(
-            "Реальная оценка. Цвет отражает контраст текущего слоя, а не достоверность. Границы: Natural Earth."
+            "Цвет сравнивает поддержку внутри каждого уровня. Точные оценки — в таблице и подсказках. Границы: Natural Earth."
         )
         w.legend_labels.append(dot)
         footer.addWidget(dot)
@@ -233,6 +230,17 @@ def build_settings(w, demo):
     w.chip_timeout.setValue(int(w.settings.value("chip_timeout", 20)))
     form.addRow("Chipoint", w.chip_url)
     form.addRow("Ожидание Chipoint", w.chip_timeout)
+    w.local_radius = QSpinBox()
+    w.local_radius.setRange(1, 200)
+    w.local_radius.setSingleStep(5)
+    w.local_radius.setSuffix(" км")
+    w.local_radius.setValue(int(w.settings.value("local_radius_km", 20)))
+    w.local_radius.setToolTip(
+        "Область поиска вокруг совпадения. Меняет только отображение; не означает точность модели."
+    )
+    w.map.local_overlay.set_radius(w.local_radius.value())
+    w.local_radius.valueChanged.connect(w.map.local_overlay.set_radius)
+    form.addRow("Радиус поиска", w.local_radius)
     w.coverage_enabled = QCheckBox("Учитывать покрытие Street View")
     w.coverage_enabled.setChecked(str(w.settings.value("coverage_enabled", "true")).lower() == "true")
     w.coverage_enabled.setToolTip(

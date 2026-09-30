@@ -1,10 +1,46 @@
-"""Зоны поиска порядка 10 км. Это координатная сетка, не административные районы."""
+"""Координатные совпадения и совместимая сетка зон порядка 10 км."""
 
 import math
 from dataclasses import dataclass, replace
 
 ROWS = 2000
 LATITUDE_STEP = 180 / ROWS
+
+
+@dataclass(frozen=True)
+class LocalPoint:
+    id: str
+    latitude: float
+    longitude: float
+    country: str
+    region: str | None
+    mass: float
+
+    def __post_init__(self):
+        if (
+            not isinstance(self.id, str)
+            or not self.id
+            or not self.country
+            or not all(math.isfinite(v) for v in (self.latitude, self.longitude, self.mass))
+            or not -90 <= self.latitude <= 90
+            or not -180 <= self.longitude <= 180
+            or self.mass < 0
+        ):
+            raise ValueError("Некорректное локальное совпадение")
+        object.__setattr__(self, "latitude", float(self.latitude))
+        object.__setattr__(self, "longitude", float(self.longitude))
+
+    @property
+    def code(self):
+        return f"{self.country}:{self.region or '-'}:{self.id}:{self.latitude}:{self.longitude}"
+
+
+def combine_points(points):
+    combined = {}
+    for point in points:
+        previous = combined.get(point.code)
+        combined[point.code] = replace(point, mass=point.mass + (previous.mass if previous else 0))
+    return tuple(combined.values())
 
 
 def columns(row):

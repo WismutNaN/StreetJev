@@ -4,7 +4,7 @@ import json
 from dataclasses import replace
 
 from streetjev.domain.evidence import Distribution, GeoEvidence
-from streetjev.domain.localization import combine_cells
+from streetjev.domain.localization import combine_cells, combine_points
 
 
 def fuse_evidence(primary: GeoEvidence, secondary: GeoEvidence, secondary_weight: float = 0.35) -> GeoEvidence:
@@ -55,5 +55,8 @@ def fuse_evidence(primary: GeoEvidence, secondary: GeoEvidence, secondary_weight
         max(primary.elapsed_ms, secondary.elapsed_ms),
         cells=combine_cells(
             replace(cell, mass=cell.mass * weight) for expert, weight in experts for cell in expert.cells
+        ),
+        points=combine_points(
+            replace(point, mass=point.mass * weight) for expert, weight in experts for point in expert.points
         ),
     )

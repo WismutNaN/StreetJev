@@ -109,7 +109,6 @@ def main():
             primary = GeoEvidence("imajev", "test", Distribution(dict.fromkeys(catalog.countries, 1)), {}, "{}", 0)
             result = AnalysisResult(window.session.round.id, sample, primary, 1)
             window.session.accept(result)
-            window.level.setCurrentIndex(2)
             assert window.map.heat_scale.empty
             payload = {
                 "schema": "streetjev.chipoint.v1",
@@ -124,21 +123,22 @@ def main():
             secondary = ChipointExpert(catalog, geography).convert(payload, 0)
             window.session.supplement(replace(result, evidence=secondary))
             window.update_snapshot()
-            assert len(window.map.cell_items) == 2
-            assert window.ranking.rowCount() == 2
+            assert len(window.map.local_overlay.points) == 3
+            assert any(
+                window.ranking.item(row, 0).data(Qt.ItemDataRole.UserRole)[0] == "point"
+                for row in range(window.ranking.rowCount())
+            )
             assert not window.map.heat_scale.empty
-            window.focus_ranked(0, 0)
+            window.map.focus_point(window.map.local_overlay.points[0])
             assert window.map.transform().m11() > 500
             fills = {code: item.brush().color().rgba() for code, item in window.map.items_by_code.items()}
-            local_fills = {code: item.brush().color().rgba() for code, item in window.map.cell_items.items()}
+            local_points = window.map.local_overlay.points
             window.details.setChecked(True)
             pump(lambda: len(window.tiles.items) == len(window.tiles.wanted) and bool(window.map.detail_labels))
             assert window.map.detail_active
             assert window.map.detail_labels
             assert fills == {code: item.brush().color().rgba() for code, item in window.map.items_by_code.items()}
-            assert local_fills == {
-                code: item.brush().color().rgba() for code, item in window.map.cell_items.items()
-            }
+            assert window.map.local_overlay.points == local_points
             assert all(not hasattr(item, "pixmap") for item in window.tiles.items.values())
             assert window.tiles.credit.isVisible()
             assert window.width() == 1000
@@ -191,7 +191,7 @@ def main():
             assert window.session.round.snapshot() == snapshot
             window.session.clear_supplements()
             window.update_snapshot()
-            assert not window.map.cell_items and window.ranking.rowCount() == 0
+            assert not window.map.local_overlay.points and window.ranking.rowCount() > 0
             window.close()
             app.processEvents()
             # Сбой сети — сигнал без зависания и немедленных повторов.

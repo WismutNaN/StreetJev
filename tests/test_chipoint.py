@@ -41,6 +41,8 @@ def test_local_coordinates_country_region_and_unknown_mass(geography):
     assert result.countries.unknown == pytest.approx(1 / 3)
     assert "AT" in result.regions and "DE" in result.regions
     assert len(json.loads(result.raw_json)["candidates"]) == 3
+    assert [(p.latitude, p.longitude) for p in result.points] == [(48.2082, 16.3738), (52.52, 13.405)]
+    assert sum(p.mass for p in result.points) == pytest.approx(2 / 3)
 
 
 def test_no_land_candidate_is_unknown_not_confident_country(geography):

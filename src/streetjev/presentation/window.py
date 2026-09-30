@@ -27,8 +27,8 @@ from streetjev.infrastructure.demo import DemoExpert
 from streetjev.infrastructure.imajev import ImajevExpert
 from streetjev.infrastructure.storage import snapshot_json
 from streetjev.presentation.hotkeys import GlobalHotkeys, portable_text
-from streetjev.presentation.map_scale import format_score
-from streetjev.presentation.map_view import heat_color
+from streetjev.presentation.map_scale import format_score, support_color
+from streetjev.presentation.ranking import ranked_places, row_score
 from streetjev.presentation.scores import display_scores
 from streetjev.presentation.selection import RegionOverlay
 from streetjev.presentation.worker import AnalysisWorker, SupplementWorker
@@ -366,6 +366,7 @@ class MainWindow(QMainWindow):
         self.answer_button.setEnabled(snapshot.frames > 0 and not self.busy)
         self.map.source = "last" if self.score_source.currentIndex() else "round"
         self.map.scale_mode = "absolute" if self.color_scale.currentIndex() else "relative"
+        self.map.left_inset = self.sidebar.width() + 8 if display_scores(snapshot, self.map.source).active else 0
         self.map.update_snapshot(snapshot)
         if self.auto_focus.isChecked():
             self.map.focus_hypotheses(snapshot)
@@ -384,107 +385,86 @@ class MainWindow(QMainWindow):
             "В скольких кадрах лидер раунда был первым. Это не вероятность правильного ответа."
         )
         selected = display_scores(snapshot, self.map.source)
-        regional = self.level.currentIndex() == 1
-        local = self.level.currentIndex() == 2
-        cells = {cell.code: cell for cell in selected.cells}
-        places = self.catalog.regions if regional else self.catalog.countries
-        probabilities = (
-            {key: cell.mass for key, cell in cells.items()}
-            if local
-            else selected.regions
-            if regional
-            else selected.countries
-        )
-        if regional:
-            probabilities = {
-                k: p for k, p in probabilities.items() if places[k].country_code in selected.observed_regions
-            }
-        ranked = sorted(probabilities.items(), key=lambda pair: pair[1], reverse=True)[:12]
-        if ranked:
-            ranked = [item for index, item in enumerate(ranked) if index < 3 or item[1] >= ranked[0][1] * 0.01]
-        self.ranking.setRowCount(len(ranked) if selected.active else 0)
+        rows = ranked_places(self.catalog, selected)
+        self.ranking.setRowCount(len(rows))
         self.sidebar.setVisible(selected.active or not self.preview.isHidden())
         self.fit_side_panel()
-        if selected.active:
-            for row, (key, _probability) in enumerate(ranked):
-                if local:
-                    cell = cells[key]
-                    lat, lon = cell.center
-                    place = self.catalog.regions.get(cell.region) or self.catalog.countries[cell.country]
-                    name = f"{lat:.2f}, {lon:.2f} · {place.label}"
-                else:
-                    name = places[key].label
-                if regional:
-                    name += " · " + places[key].country_code
-                item = QTableWidgetItem(name)
-                item.setData(Qt.ItemDataRole.UserRole, key if local else places[key].country_code or key)
-                item.setToolTip(name + ("\nЗона поиска ≈10 км; двойной клик — приблизить" if local else ""))
-                self.ranking.setItem(row, 0, item)
-                for column, source in ((1, "round"), (2, "last")):
-                    scores = display_scores(snapshot, source)
-                    available = scores.active and (
-                        not regional or places[key].country_code in scores.observed_regions
-                    )
-                    if local:
-                        values = {cell.code: cell.mass for cell in scores.cells}
-                        value, available = values.get(key, 0), key in values
-                    else:
-                        value = (scores.regions if regional else scores.countries).get(key, 0)
-                    self.ranking.setItem(row, column, QTableWidgetItem(format_score(value) if available else "—"))
-        if local and not selected.cells:
-            self.scale_caption.setText("Нет зон")
-            self.scale_caption.setToolTip("Для уточнения внутри региона включите Chipoint и проанализируйте кадр")
+        sources = {source: display_scores(snapshot, source) for source in ("round", "last")}
+        for row, entry in enumerate(rows):
+            item = QTableWidgetItem(entry.label)
+            item.setData(Qt.ItemDataRole.UserRole, (entry.kind, entry.code))
+            item.setToolTip(
+                "Двойной клик — приблизить" + ("\nКоординаты совпадения Chipoint" if entry.kind == "point" else "")
+            )
+            font = item.font()
+            font.setBold(entry.kind == "country")
+            item.setFont(font)
+            self.ranking.setItem(row, 0, item)
+            for column, source in ((1, "round"), (2, "last")):
+                value = row_score(entry, sources[source])
+                self.ranking.setItem(
+                    row, column, QTableWidgetItem(format_score(value) if value is not None else "—")
+                )
 
     def display_changed(self):
         self.update_snapshot()
 
     def update_legend(self, scale):
-        ticks = scale.legend()
+        active = not self.map.country_scale.empty
         for index, dot in enumerate(self.legend_labels):
-            dot.setVisible(index < len(ticks))
-            if index < len(ticks):
-                intensity, text = ticks[index]
-                dot.setText(text)
-                foreground = "#102920" if intensity >= 0.4 else "#dce7ef"
-                dot.setStyleSheet(
-                    f"background: {heat_color(intensity).name()}; color: {foreground}; "
-                    "border-radius: 3px; padding: 3px;"
-                )
-        if scale.empty:
-            message = "Нет оценок"
-        elif scale.flat:
-            message = "Равные оценки"
-        elif scale.mode == "relative":
-            message = f"Макс. {format_score(scale.maximum)}"
-        else:
-            message = "Абсолютная"
-        self.scale_caption.setText(message)
+            intensity = index / (len(self.legend_labels) - 1)
+            dot.setVisible(active)
+            dot.setText(
+                format_score(intensity)
+                if self.map.scale_mode == "absolute"
+                else "Ниже"
+                if index == 0
+                else "Выше"
+                if index == len(self.legend_labels) - 1
+                else ""
+            )
+            dot.setStyleSheet(
+                f"background: {support_color(intensity).name()}; color: {'#102920' if intensity >= 0.3 else '#dce7ef'}; border-radius: 3px; padding: 3px;"
+            )
+        self.scale_caption.setText(
+            "Нет оценок" if not active else "Внутри уровня" if self.map.scale_mode == "relative" else "Общая шкала"
+        )
         self.scale_caption.setToolTip(
-            "В легенде реальные оценки; яркость не означает достоверность. Серый — нет данных или нижняя граница шкалы."
+            "Контраст отдельно для стран, всех исследованных регионов и локальных групп. Цвет не означает достоверность; круг — область поиска."
         )
 
-    def level_changed(self):
-        if hasattr(self, "map"):
-            self.map.set_level(("countries", "regions", "local")[self.level.currentIndex()])
-            self.update_snapshot()
+    def show_location_details(self, message):
+        self.status.setText(message)
+        self.status.setToolTip(message)
 
     def focus_leader(self):
         self.auto_focus.setChecked(False)
         scores = display_scores(self.session.round.snapshot(), self.map.source)
         if scores.active:
-            if self.map.level == "local" and scores.cells:
-                self.map.focus_cell(max(scores.cells, key=lambda cell: cell.mass).code)
-            else:
-                self.map.focus_country(max(scores.countries, key=scores.countries.get))
+            country = max(scores.countries, key=scores.countries.get)
+            regions = self.catalog.regions_of(country) if country in scores.observed_regions else []
+            code = max(regions, key=lambda region: scores.regions.get(region.code, 0)).code if regions else country
+            self.map.focus_place(code)
 
     def focus_ranked(self, row, column):
         self.auto_focus.setChecked(False)
         item = self.ranking.item(row, 0)
-        if item:
-            if self.map.level == "local":
-                self.map.focus_cell(item.data(Qt.ItemDataRole.UserRole))
-            else:
-                self.map.focus_country(item.data(Qt.ItemDataRole.UserRole))
+        if not item:
+            return
+        kind, code = item.data(Qt.ItemDataRole.UserRole)
+        if kind == "point":
+            point = next(
+                (
+                    p
+                    for p in display_scores(self.session.round.snapshot(), self.map.source).points
+                    if p.code == code
+                ),
+                None,
+            )
+            if point:
+                self.map.focus_point(point)
+        else:
+            self.map.focus_place(code)
 
     def apply_hotkeys(self):
         try:
@@ -541,6 +521,7 @@ class MainWindow(QMainWindow):
             "chip_timeout": self.chip_timeout.value(),
             "coverage_enabled": self.coverage_enabled.isChecked(),
             "map_details": self.details.isChecked(),
+            "local_radius_km": self.local_radius.value(),
         }.items():
             self.settings.setValue(name, value)
         self.settings.sync()

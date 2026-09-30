@@ -11,7 +11,7 @@ from shapely.geometry import shape
 
 from streetjev.domain.calibration import CalibrationProfile
 from streetjev.domain.evidence import Distribution, GeoEvidence
-from streetjev.domain.localization import combine_cells, locate_cell
+from streetjev.domain.localization import LocalPoint, combine_cells, combine_points, locate_cell
 from streetjev.infrastructure.coverage import CoverageDensity
 from streetjev.infrastructure.imajev import InferenceError
 
@@ -118,6 +118,7 @@ class ChipointExpert:
         countries = dict.fromkeys(self.catalog.countries, 0.0)
         regions, located_by_country, missing = {}, {}, 0.0
         cells = []
+        points = []
         for candidate, weight, (country, region) in zip(candidates, weights, locations, strict=True):
             mass = weight / total
             if densities:
@@ -131,6 +132,16 @@ class ChipointExpert:
             countries[country] += mass
             if mass > 0:
                 cells.append(locate_cell(float(candidate["lat"]), float(candidate["lon"]), country, region, mass))
+                points.append(
+                    LocalPoint(
+                        str(candidate["id"]),
+                        float(candidate["lat"]),
+                        float(candidate["lon"]),
+                        country,
+                        region,
+                        mass,
+                    )
+                )
             if region and region in self.catalog.regions:
                 regions.setdefault(
                     country, dict.fromkeys((r.code for r in self.catalog.regions_of(country)), 0.0)
@@ -148,6 +159,7 @@ class ChipointExpert:
             json.dumps(payload, ensure_ascii=False, allow_nan=False),
             elapsed_ms,
             cells=combine_cells(cells),
+            points=combine_points(points),
         )
 
     def infer(self, frame):

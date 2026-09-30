@@ -5,7 +5,7 @@ from uuid import uuid4
 
 from streetjev.domain.evidence import Distribution, Frame, GeoEvidence
 from streetjev.domain.geography import GeoCatalog
-from streetjev.domain.localization import LocalCell, combine_cells, local_scores
+from streetjev.domain.localization import LocalCell, LocalPoint, combine_cells, combine_points, local_scores
 
 AGGREGATION_VERSION = "weighted_linear_v2"
 
@@ -44,6 +44,8 @@ class RoundSnapshot:
     agreeing_frames: int = 0
     cells: tuple[LocalCell, ...] = ()
     last_cells: tuple[LocalCell, ...] = ()
+    points: tuple[LocalPoint, ...] = ()
+    last_points: tuple[LocalPoint, ...] = ()
 
 
 class GeoRound:
@@ -70,6 +72,7 @@ class GeoRound:
         self._fingerprints: list[bytes] = []
         self._seen_fingerprints: set[bytes] = set()
         self._cells: tuple[LocalCell, ...] = ()
+        self._points: tuple[LocalPoint, ...] = ()
         self._local_weight = 0.0
 
     def novelty(self, frame: Frame) -> float:
@@ -109,7 +112,7 @@ class GeoRound:
             region_weights[country] += weight * (1 - distribution.unknown)
             if weight * (1 - distribution.unknown) > 0:
                 observed.add(country)
-        for cell in evidence.cells:
+        for cell in (*evidence.cells, *evidence.points):
             if cell.country not in self.catalog.countries or (
                 cell.region
                 and (
@@ -119,7 +122,9 @@ class GeoRound:
             ):
                 raise ValueError("Неизвестный родитель локальной зоны")
         cells = combine_cells((*self._cells, *(replace(c, mass=c.mass * novelty) for c in evidence.cells)))
+        points = combine_points((*self._points, *(replace(p, mass=p.mass * novelty) for p in evidence.points)))
         self._cells = cells
+        self._points = points
         self._local_weight += novelty
         self.countries = countries
         self.region_conditionals = conditionals
@@ -188,4 +193,6 @@ class GeoRound:
             else 0,
             cells=local_scores(self._cells, self._local_weight, self.countries, regions),
             last_cells=local_scores(last.cells, 1, last.countries.probabilities, last_regions) if last else (),
+            points=local_scores(self._points, self._local_weight, self.countries, regions),
+            last_points=local_scores(last.points, 1, last.countries.probabilities, last_regions) if last else (),
         )

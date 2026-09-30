@@ -68,7 +68,6 @@ def main():
         assert not window.map.answer_mode
         window.start_analysis(lambda: (_ for _ in ()).throw(AssertionError("Захват после разметки")))
         assert not window.busy
-        window.level.setCurrentIndex(1)
         window.map.focus_country("DE")
         window.answer_button.click()
         QTest.mouseClick(window.map.viewport(), Qt.MouseButton.LeftButton, pos=point(48.137, 11.575))

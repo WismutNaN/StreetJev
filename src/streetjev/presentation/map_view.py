@@ -1,79 +1,76 @@
-import math
-from itertools import pairwise
-
-from PySide6.QtCore import QPointF, QRectF, Qt, Signal
+from PySide6.QtCore import QEvent, QPointF, QRectF, Qt, Signal
 from PySide6.QtGui import QBrush, QColor, QFont, QPainter, QPainterPath, QPen, QStaticText
-from PySide6.QtWidgets import QGraphicsItem, QGraphicsPathItem, QGraphicsScene, QGraphicsView
+from PySide6.QtWidgets import QGraphicsItem, QGraphicsPathItem, QGraphicsScene, QGraphicsView, QToolTip
 
 from streetjev.domain.geography import GeoCatalog
 from streetjev.domain.round import RoundSnapshot
 from streetjev.presentation.auto_focus import Bounds, focus_bounds
-from streetjev.presentation.map_scale import HeatScale, format_score
+from streetjev.presentation.local_overlay import LocalOverlay
+from streetjev.presentation.map_geometry import project, radius_degrees, unproject
+from streetjev.presentation.map_scale import HeatScale, format_score, support_color
 from streetjev.presentation.scores import display_scores
 
 
-def project(lon, lat):
-    lat = min(84, max(-84, lat))
-    return lon, -math.degrees(math.log(math.tan(math.pi / 4 + math.radians(lat) / 2)))
+class CountryOutline(QGraphicsPathItem):
+    def __init__(self, path):
+        super().__init__(path)
+        self.color, self.width = QColor(), 1
+        self.setPen(QPen(Qt.PenStyle.NoPen))
+        self.setZValue(2)
+        self.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
 
+    def shape(self):
+        return QPainterPath()
 
-def unproject(x, y):
-    return x, math.degrees(2 * math.atan(math.exp(math.radians(-y))) - math.pi / 2)
-
-
-def heat_color(intensity):
-    # Палитра общая; преобразование реальной оценки в интенсивность выполняет HeatScale.
-    stops = [
-        (0, (25, 42, 55)),
-        (0.02, (34, 70, 92)),
-        (0.1, (27, 139, 138)),
-        (0.4, (80, 216, 168)),
-        (0.7, (237, 203, 98)),
-        (1, (251, 111, 80)),
-    ]
-    for (a, ca), (b, cb) in pairwise(stops):
-        if intensity <= b:
-            t = max(0, (intensity - a) / (b - a))
-            return QColor(*(round(x + (y - x) * t) for x, y in zip(ca, cb)))
-    return QColor(*stops[-1][1])
+    def paint(self, painter, option, widget=None):
+        path = self.path()
+        painter.setClipPath(path, Qt.ClipOperation.IntersectClip)
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        for color, width in ((QColor(16, 30, 41, 180), self.width + 2), (self.color, self.width)):
+            pen = QPen(color, width)
+            pen.setCosmetic(True)
+            painter.setPen(pen)
+            painter.drawPath(path)
 
 
 class MapView(QGraphicsView):
     viewport_changed = Signal()
     answer_clicked = Signal(float, float)
-    country_clicked = Signal(str)
     scale_changed = Signal(object)
     manual_navigation = Signal()
+    location_selected = Signal(str)
 
     def __init__(self, catalog: GeoCatalog, geography: dict):
         super().__init__()
         self.catalog = catalog
         self.setScene(QGraphicsScene(self))
-        self.setBackgroundBrush(QColor("#0b1620"))
+        self.setBackgroundBrush(QColor("#101e29"))
         self.setRenderHint(QPainter.RenderHint.Antialiasing)
         self.setDragMode(QGraphicsView.DragMode.ScrollHandDrag)
         self.setTransformationAnchor(QGraphicsView.ViewportAnchor.AnchorUnderMouse)
         self.setFrameShape(QGraphicsView.Shape.NoFrame)
         self.items_by_code = {}
         self.country_bounds = {}
-        self.level = "countries"
         self.source = "round"
         self.scale_mode = "relative"
         self.heat_scale = HeatScale.from_scores([])
+        self.country_scale = HeatScale.from_scores([])
         self.snapshot = None
         self.auto_fit = True
+        self.left_inset = 0
         self.answer_mode = False
         self._answer_press = None
+        self._map_press = None
         self.answer_marker = None
         self.detail_active = False
         self.detail_labels = []
+        self.country_labels = []
         self._label_key = None
         self._label_layout = []
         self._label_texts = {}
         self._label_font = QFont("Segoe UI")
         self._label_font.setPixelSize(11)
-        self.cell_items = {}
-        self.cells_by_code = {}
+        self.country_outlines = {}
         for feature in geography["features"]:
             properties, geometry = feature["properties"], feature["geometry"]
             polygons = [geometry["coordinates"]] if geometry["type"] == "Polygon" else geometry["coordinates"]
@@ -99,7 +96,7 @@ class MapView(QGraphicsView):
             pen = QPen(QColor("#486071"), 0.55)
             pen.setCosmetic(True)
             item.setPen(pen)
-            item.setBrush(QColor("#192a37"))
+            item.setBrush(QColor("#1a2d3b"))
             item.setZValue(1 if properties.get("country") else 0)
             item.setVisible(not properties.get("country"))
             item.setToolTip(properties["label"])
@@ -107,10 +104,29 @@ class MapView(QGraphicsView):
             self.items_by_code[properties["code"]] = item
             if not properties.get("country"):
                 self.country_bounds[properties["code"]] = path.boundingRect()
+                outline = CountryOutline(path)
+                outline.hide()
+                self.scene().addItem(outline)
+                self.country_outlines[properties["code"]] = outline
+        self.local_overlay = LocalOverlay(self)
+        self.scene().addItem(self.local_overlay)
         self.scene().setSceneRect(-183, -180, 366, 325)
 
     def fitInView(self, *args):
+        if args and isinstance(args[0], QRectF) and self.left_inset:
+            rectangle = QRectF(args[0])
+            width, height = self.viewport().width() - 8, self.viewport().height() - 8
+            inset = min(self.left_inset, max(0, width - 100))
+            scale = min((width - inset) / max(rectangle.width(), 1e-9), height / max(rectangle.height(), 1e-9))
+            if scale > 0:
+                rectangle.adjust(-inset / scale, 0, 0, 0)
+            args = (rectangle, *args[1:])
         super().fitInView(*args)
+        if self.transform().m11() > 399999:
+            center = self.mapToScene(self.viewport().rect().center())
+            factor = 399999 / self.transform().m11()
+            self.scale(factor, factor)
+            self.centerOn(center)
         self.viewport_changed.emit()
 
     def scrollContentsBy(self, dx, dy):
@@ -127,7 +143,7 @@ class MapView(QGraphicsView):
     def set_detail_labels(self, labels):
         self.detail_labels = labels
         self._label_key = None
-        names = {item[2] for item in labels}
+        names = {item[2] for item in [*labels, *self.country_labels]}
         self._label_texts = {name: text for name, text in self._label_texts.items() if name in names}
         self.viewport().update()
 
@@ -141,7 +157,7 @@ class MapView(QGraphicsView):
         viewport = QRectF(self.viewport().rect())
         visible = self.mapToScene(self.viewport().rect()).boundingRect()
         limit = max(6, min(32, self.viewport().width() * self.viewport().height() // 22000))
-        for x, y, name, _population in self.detail_labels:
+        for x, y, name, _population in [*self.country_labels, *self.detail_labels]:
             if not visible.contains(QPointF(x, y)):
                 continue
             text = self._label_texts.get(name)
@@ -169,7 +185,7 @@ class MapView(QGraphicsView):
 
     def drawForeground(self, painter, rect):
         super().drawForeground(painter, rect)
-        if not self.detail_labels:
+        if not self.detail_labels and not self.country_labels:
             return
         painter.save()
         painter.resetTransform()
@@ -212,6 +228,10 @@ class MapView(QGraphicsView):
             event.accept()
             return
         self.manual_navigation.emit()
+        cluster = self.local_overlay.hit(event.position().toPoint())
+        if cluster:
+            self.focus_cluster(cluster)
+            return
         if self.detail_active and self.transform().m11() > 200:
             point = self.mapToScene(event.position().toPoint())
             self.auto_fit = False
@@ -220,13 +240,8 @@ class MapView(QGraphicsView):
             self.viewport_changed.emit()
             return
         item = self.itemAt(event.position().toPoint())
-        if item and item.data(2) in self.cells_by_code:
-            self.focus_cell(item.data(2))
-            return
         if item and (item.data(1) or item.data(0)):
-            code = item.data(1) or item.data(0)
-            self.country_clicked.emit(code)
-            self.focus_country(code)
+            self.focus_place(item.data(0))
         else:
             if self.detail_active:
                 point = self.mapToScene(event.position().toPoint())
@@ -241,10 +256,21 @@ class MapView(QGraphicsView):
         if self.answer_mode and event.button() == Qt.MouseButton.LeftButton:
             self._answer_press = event.position().toPoint()
         if event.button() == Qt.MouseButton.LeftButton:
+            self._map_press = event.position().toPoint()
             self.manual_navigation.emit()
         super().mousePressEvent(event)
 
     def mouseReleaseEvent(self, event):
+        point = event.position().toPoint()
+        if (
+            not self.answer_mode
+            and self._map_press is not None
+            and (point - self._map_press).manhattanLength() <= 4
+        ):
+            message = self.location_description(point)
+            if message:
+                self.location_selected.emit(message.replace("\n", " · "))
+        self._map_press = None
         if self.answer_mode and event.button() == Qt.MouseButton.LeftButton and self._answer_press is not None:
             start, self._answer_press = self._answer_press, None
             if (event.position().toPoint() - start).manhattanLength() <= 4:
@@ -261,20 +287,62 @@ class MapView(QGraphicsView):
         if self.snapshot:
             self.update_snapshot(self.snapshot)
 
-    @staticmethod
-    def cell_rect(cell):
-        west, south, east, north = cell.bounds
-        left, top = project(west, north)
-        right, bottom = project(east, south)
-        return QRectF(left, top, right - left, bottom - top)
+    def viewportEvent(self, event):
+        if event.type() == QEvent.Type.ToolTip and hasattr(self, "local_overlay"):
+            cluster = self.local_overlay.hit(event.pos())
+            if cluster:
+                QToolTip.showText(event.globalPos(), self.cluster_description(cluster), self.viewport())
+                return True
+        return super().viewportEvent(event)
 
-    def focus_cell(self, code):
-        cell = self.cells_by_code.get(code)
-        if cell:
-            rect = self.cell_rect(cell)
+    def location_description(self, position):
+        cluster = self.local_overlay.hit(position)
+        if cluster:
+            return self.cluster_description(cluster)
+        item = self.itemAt(position)
+        return item.toolTip() if item else ""
+
+    def cluster_description(self, cluster):
+        scores = display_scores(self.snapshot, self.source)
+        first = cluster.points[0]
+        lines = [f"{self.catalog.countries[first.country].label}: {format_score(scores.countries[first.country])}"]
+        if first.region:
+            lines.append(
+                f"{self.catalog.regions[first.region].label}: {format_score(scores.regions.get(first.region, 0))}"
+            )
+        if len(cluster.points) == 1:
+            lines.append(f"Chipoint: {first.latitude:.5f}, {first.longitude:.5f} · {format_score(cluster.mass)}")
+            lines.append(f"Радиус поиска ≈{self.local_overlay.radius_km} км; не точность модели")
+        else:
+            lines.append(f"Chipoint: {len(cluster.points)} совпадений · {format_score(cluster.mass)}")
+            lines.append("Группа для текущего масштаба; двойной клик раскрывает точки")
+        return "\n".join(lines)
+
+    def focus_place(self, code):
+        if code in self.country_bounds:
+            self.focus_country(code)
+        elif code in self.items_by_code:
+            self.auto_fit = False
+            rect = self.items_by_code[code].boundingRect()
+            self.fitInView(rect.adjusted(-0.4, -0.4, 0.4, 0.4), Qt.AspectRatioMode.KeepAspectRatio)
+
+    def focus_point(self, point):
+        x, y = project(point.longitude, point.latitude)
+        radius = radius_degrees(point.latitude, self.local_overlay.radius_km) * 1.6
+        self.auto_fit = False
+        self.fitInView(QRectF(x - radius, y - radius, 2 * radius, 2 * radius), Qt.AspectRatioMode.KeepAspectRatio)
+
+    def focus_cluster(self, cluster):
+        if len(cluster.points) == 1:
+            self.focus_point(cluster.points[0])
+        else:
+            positions = [project(p.longitude, p.latitude) for p in cluster.points]
+            left, right = min(p[0] for p in positions), max(p[0] for p in positions)
+            top, bottom = min(p[1] for p in positions), max(p[1] for p in positions)
+            margin = max(0.000001, max(right - left, bottom - top) * 0.25)
             self.auto_fit = False
             self.fitInView(
-                rect.adjusted(-rect.width(), -rect.height(), rect.width(), rect.height()),
+                QRectF(left - margin, top - margin, right - left + 2 * margin, bottom - top + 2 * margin),
                 Qt.AspectRatioMode.KeepAspectRatio,
             )
 
@@ -294,22 +362,17 @@ class MapView(QGraphicsView):
 
     def focus_hypotheses(self, snapshot):
         scores = display_scores(snapshot, self.source)
-        values = scores.countries
-        boxes = self.country_bounds
-        if self.level == "local" and scores.cells:
-            values = {cell.code: cell.mass for cell in scores.cells}
-            boxes = {cell.code: self.cell_rect(cell) for cell in scores.cells}
-        if self.level == "regions" and scores.observed_regions:
-            values = {
-                code: value
-                for code, value in scores.regions.items()
-                if self.catalog.regions[code].country_code in scores.observed_regions
-            }
-            boxes = {code: self.items_by_code[code].boundingRect() for code in values}
-            # Нельзя кадрировать по регионам, если ведущие страны ещё не исследованы.
-            covered = sum(scores.countries[c] for c in scores.observed_regions)
-            if covered < 0.55:
-                values, boxes = scores.countries, self.country_bounds
+        values, boxes = {}, {}
+        # Используем совместные оценки: регион заменяет свою страну, а не добавляет её массу второй раз.
+        for country, mass in scores.countries.items():
+            if country in scores.observed_regions:
+                for region in self.catalog.regions_of(country):
+                    values[region.code] = scores.regions.get(region.code, 0)
+                    boxes[region.code] = self.items_by_code[region.code].boundingRect()
+            else:
+                values[country] = mass
+                boxes[country] = self.country_bounds[country]
+        covered = sum(scores.countries[c] for c in scores.observed_regions)
         target = (
             focus_bounds(
                 values,
@@ -317,7 +380,7 @@ class MapView(QGraphicsView):
                     code: Bounds(rect.left(), rect.top(), rect.right(), rect.bottom())
                     for code, rect in boxes.items()
                 },
-                minimum=(0.7, 0.55) if self.level == "local" and scores.cells else (30, 22),
+                minimum=(8, 6) if covered >= 0.55 else (30, 22),
             )
             if scores.active
             else None
@@ -331,85 +394,69 @@ class MapView(QGraphicsView):
                 Qt.AspectRatioMode.KeepAspectRatio,
             )
 
-    def set_level(self, level):
-        self.level = level
-        if self.snapshot:
-            self.update_snapshot(self.snapshot)
-
     def update_snapshot(self, snapshot: RoundSnapshot):
         self.snapshot = snapshot
         scores = display_scores(snapshot, self.source)
         active = scores.active
-        values = (
-            scores.countries
-            if self.level == "countries"
-            else {cell.code: cell.mass for cell in scores.cells}
-            if self.level == "local"
-            else {
-                code: value
-                for code, value in scores.regions.items()
-                if self.catalog.regions[code].country_code in scores.observed_regions
-            }
-        )
-        scale_values = list(values.values()) if active else []
-        if self.level == "local" and scale_values:
-            scale_values.append(0)  # Остальная карта не имеет координатной поддержки.
-        self.heat_scale = HeatScale.from_scores(scale_values, self.scale_mode)
+        values = {
+            code: value
+            for code, value in scores.regions.items()
+            if self.catalog.regions[code].country_code in scores.observed_regions
+        }
+        self.country_scale = HeatScale.from_scores(scores.countries.values() if active else [], self.scale_mode)
+        self.heat_scale = HeatScale.from_scores(values.values() if active else [], self.scale_mode)
         for code, item in self.items_by_code.items():
             country = item.data(1)
             if country:
-                visible = self.level in ("regions", "local") and country in scores.observed_regions and active
-                item.setVisible(visible)
-                probability = scores.regions.get(code, 0)
+                item.setVisible(active and country in scores.observed_regions)
+                probability = values.get(code, 0)
+                color = support_color(self.heat_scale.intensity(probability))
+                color.setAlphaF(0.42 if active and probability > 0 and not self.answer_mode else 0)
+                item.setBrush(color)
                 label = self.catalog.regions[code].label
+                item.setToolTip(
+                    f"{self.catalog.countries[country].label}: {format_score(scores.countries.get(country, 0))}\n"
+                    f"{label}: {format_score(probability)}\nСовместная поддержка региона, не вероятность правильного ответа"
+                )
             else:
                 probability = scores.countries.get(code, 0)
+                item.setBrush(QColor("#1a2d3b"))
                 label = self.catalog.countries[code].label
-            fill = self.heat_scale.intensity(probability) if active else 0
-            if (not country and self.level != "countries") or self.level == "local":
-                # Массу страны нельзя окрашивать по общей шкале совместных региональных оценок.
-                fill = 0
-            color = heat_color(0 if self.answer_mode else fill)
-            item.setBrush(QBrush(color))
-            pen = item.pen()
-            pen.setColor(QColor("#486071"))
-            pen.setWidthF(0.55)
-            item.setPen(pen)
-            suffix = f"Оценка: {format_score(probability)}" if active else "Пока нет наблюдений"
-            if country and active:
-                country_score = scores.countries.get(country, 0)
-                conditional = probability / country_score if country_score else 0
-                suffix += f"\nВнутри страны: {format_score(conditional)}; страна: {format_score(country_score)}"
-            if not country and self.level != "countries" and code not in scores.observed_regions:
-                suffix += "\nРегион не анализировался"
-            caption = "Раунд" if self.source == "round" else "Последний кадр"
-            item.setToolTip(f"{label} · {caption}\n{suffix}\nОценки модели, не вероятность правильного ответа")
-        for item in self.cell_items.values():
-            self.scene().removeItem(item)
-        self.cell_items = {}
-        self.cells_by_code = {cell.code: cell for cell in scores.cells}
-        if self.level == "local":
-            for cell in scores.cells:
-                path = QPainterPath()
-                path.addRect(self.cell_rect(cell))
-                parent = self.items_by_code.get(cell.region or cell.country)
-                if parent:
-                    path = path.intersected(parent.path())
-                item = QGraphicsPathItem(path)
-                color = heat_color(self.heat_scale.intensity(cell.mass))
-                pen = QPen(color, 1.4)
-                pen.setCosmetic(True)
-                item.setPen(pen)
-                color.setAlphaF(0 if self.answer_mode else 0.80)
-                item.setBrush(color)
-                item.setZValue(3)
-                item.setData(2, cell.code)
-                lat, lon = cell.center
-                place = self.catalog.regions.get(cell.region) or self.catalog.countries[cell.country]
-                item.setToolTip(
-                    f"{place.label} · зона ≈10 км\n{lat:.3f}, {lon:.3f}\n"
-                    f"Поддержка: {format_score(cell.mass)}\nКоординаты совпадений Chipoint, не точность до адреса"
+                item.setToolTip(f"{label}: {format_score(probability)}" if active else label)
+                if active and code not in scores.observed_regions:
+                    item.setToolTip(item.toolTip() + "\nРегионы не анализировались")
+                outline = self.country_outlines[code]
+                intensity = self.country_scale.intensity(probability)
+                outline.setVisible(
+                    active and not self.answer_mode and probability > 0 and not self.country_scale.flat
                 )
-                self.scene().addItem(item)
-                self.cell_items[cell.code] = item
+                outline.color = support_color(intensity)
+                outline.color.setAlphaF(0.25 + 0.6 * intensity)
+                outline.width = 2 * (0.55 + 1.8 * intensity**0.5)
+                outline.update()
+            pen = QPen(QColor("#365061"), 0.45 if country else 0.55)
+            pen.setCosmetic(True)
+            item.setPen(pen)
+        self.country_labels = []
+        if active and not self.answer_mode and not self.country_scale.flat:
+            leaders = sorted(scores.countries, key=scores.countries.get, reverse=True)[:5]
+            for code in leaders:
+                if scores.countries[code] < scores.countries[leaders[0]] * 0.1:
+                    continue
+                center = self.country_bounds[code].center()
+                self.country_labels.append(
+                    (
+                        center.x(),
+                        center.y(),
+                        f"{self.catalog.countries[code].label} · {format_score(scores.countries[code])}",
+                        1e12,
+                    )
+                )
+        self._label_key = None
+        names = {item[2] for item in [*self.detail_labels, *self.country_labels]}
+        self._label_texts = {name: text for name, text in self._label_texts.items() if name in names}
+        self.local_overlay.set_points(scores.points if active else (), self.scale_mode)
+        self.local_overlay.image_key = None
+        self.local_overlay.update()
         self.scale_changed.emit(self.heat_scale)
+        self.viewport().update()

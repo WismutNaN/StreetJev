@@ -7,7 +7,7 @@ from conftest import evidence, frame
 from streetjev.application.session import AnalysisResult, Session
 from streetjev.domain.evidence import Distribution
 from streetjev.domain.fusion import fuse_evidence
-from streetjev.domain.localization import combine_cells, local_scores, locate_cell
+from streetjev.domain.localization import LocalPoint, combine_cells, local_scores, locate_cell
 from streetjev.domain.round import GeoRound
 from streetjev.infrastructure.storage import SqliteRoundRepository
 
@@ -43,9 +43,11 @@ def test_localization_fusion_novelty_reset_and_disable(catalog, tmp_path):
         evidence(at=0.9, regions=primary.regions),
         source="chipoint",
         cells=(locate_cell(47.2, 11.3, "AT", "AT-7", 0.9),),
+        points=(LocalPoint("a", 47.2345678, 11.3456789, "AT", "AT-7", 0.9),),
     )
     fused = fuse_evidence(primary, secondary)
     assert fused.cells[0].mass == pytest.approx(0.9 * 0.35)
+    assert fused.points[0].mass == pytest.approx(0.9 * 0.35)
     repo = SqliteRoundRepository(tmp_path / "rounds.sqlite3")
     session = Session(catalog, repo)
     first = AnalysisResult(session.round.id, frame(), primary, 1)
@@ -56,18 +58,25 @@ def test_localization_fusion_novelty_reset_and_disable(catalog, tmp_path):
     second = AnalysisResult(session.round.id, frame(255, "two"), primary, 0.5)
     session.accept(second)
     assert not session.round.snapshot().last_cells
+    assert not session.round.snapshot().last_points
     session.supplement(replace(second, evidence=secondary))
     snapshot = session.round.snapshot()
     assert snapshot.frames == 2 and snapshot.cells[0].mass == pytest.approx(one)
+    assert snapshot.points[0].mass == pytest.approx(one)
+    assert snapshot.points[0].latitude == 47.2345678
+    assert len(snapshot.points) == 1
     assert not session.supplement(replace(second, evidence=secondary))
     data = json.loads(
         repo.connection.execute("SELECT snapshot FROM rounds WHERE id=?", (session.round.id,)).fetchone()[0]
     )
     assert data["cells"][0]["mass"] == pytest.approx(one)
+    assert data["points"][0]["longitude"] == 11.3456789
     session.clear_supplements()
     assert not session.round.snapshot().cells
+    assert not session.round.snapshot().points
     session.reset()
     assert not session.round.snapshot().last_cells
+    assert not session.round.snapshot().last_points
     repo.close()
 
 
@@ -75,6 +84,10 @@ def test_bad_parent_is_atomic(catalog):
     state = GeoRound(catalog)
     before = state.snapshot()
     wrong = replace(evidence(), cells=(locate_cell(47, 11, "AT", "DE-BY", 0.5),))
+    with pytest.raises(ValueError):
+        state.accept(state.id, frame(), wrong, 1)
+    assert state.snapshot() == before
+    wrong = replace(evidence(), points=(LocalPoint("bad", 47, 11, "AT", "DE-BY", 0.5),))
     with pytest.raises(ValueError):
         state.accept(state.id, frame(), wrong, 1)
     assert state.snapshot() == before

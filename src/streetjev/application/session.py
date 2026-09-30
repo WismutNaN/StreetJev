@@ -116,6 +116,7 @@ class Session:
             or old.source != new.source
             or old.model_version != new.model_version
             or old.cells != new.cells
+            or old.points != new.points
             or not set(new.regions) - set(old.regions)
             or any(new.regions.get(key) != value for key, value in old.regions.items())
         ):

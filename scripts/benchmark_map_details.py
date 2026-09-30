@@ -10,7 +10,7 @@ os.environ["QT_QPA_PLATFORM"] = "offscreen"
 
 import mapbox_vector_tile
 from PySide6.QtCore import Qt
-from PySide6.QtGui import QImage, QPainter
+from PySide6.QtGui import QColor, QFont, QFontDatabase, QImage, QPainter
 from PySide6.QtNetwork import QNetworkDiskCache
 from PySide6.QtWidgets import QApplication
 
@@ -31,6 +31,9 @@ def timed(call, repeats=5):
 
 def main():
     app = QApplication([])
+    font = Path(os.environ.get("WINDIR", "C:/Windows")) / "Fonts" / "segoeui.ttf"
+    if font.exists():
+        QFontDatabase.addApplicationFont(str(font))
     root = Path("data/map-vector-cache")
     cache = QNetworkDiskCache()
     # fileMetaData/data только читают ранее скачанные файлы; сетевого клиента здесь нет.
@@ -52,9 +55,11 @@ def main():
         content = bytes(device.readAll())
         device.close()
         key = tuple(int(value) for value in url.path().removesuffix(".mvt").split("/")[-3:])
-        full, decode_ms = timed(lambda: mapbox_vector_tile.decode(content, default_options={"y_coord_down": True}))
-        details, filtered_ms = timed(lambda: decode_details(content, key[0]))
-        tile, construct_ms = timed(lambda: RoadTile(key, details))
+        full, decode_ms = timed(
+            lambda content=content: mapbox_vector_tile.decode(content, default_options={"y_coord_down": True})
+        )
+        details, filtered_ms = timed(lambda content=content, key=key: decode_details(content, key[0]))
+        tile, construct_ms = timed(lambda key=key, details=details: RoadTile(key, details))
         view.scene().addItem(tile)
         view.set_detail_labels(tile.labels)
         view.auto_fit = False
@@ -62,10 +67,17 @@ def main():
         app.processEvents()
         target = QImage(view.size(), QImage.Format.Format_ARGB32_Premultiplied)
 
-        def render():
+        def render(target=target):
             target.fill(Qt.GlobalColor.transparent)
             painter = QPainter(target)
             view.render(painter)
+            painter.setFont(QFont("Segoe UI", 9))
+            painter.setPen(QColor("#a5b3bc"))
+            painter.drawText(
+                target.rect().adjusted(6, 6, -6, -6),
+                Qt.AlignmentFlag.AlignBottom | Qt.AlignmentFlag.AlignRight,
+                "© OpenStreetMap contributors",
+            )
             painter.end()
 
         _, render_ms = timed(render, 12)

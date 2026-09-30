@@ -3,6 +3,18 @@
 import math
 from collections.abc import Iterable
 from dataclasses import dataclass
+from itertools import pairwise
+
+from PySide6.QtGui import QColor
+
+
+def support_color(intensity):
+    stops = [(0, (56, 116, 135)), (0.3, (96, 176, 163)), (0.65, (214, 180, 107)), (1, (241, 139, 87))]
+    for (left, a), (right, b) in pairwise(stops):
+        if intensity <= right:
+            t = max(0, (intensity - left) / (right - left))
+            return QColor(*(round(x + (y - x) * t) for x, y in zip(a, b)))
+    return QColor(*stops[-1][1])
 
 
 def format_score(value: float) -> str:
