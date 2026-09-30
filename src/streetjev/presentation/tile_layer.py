@@ -1,10 +1,50 @@
 """Асинхронная подложка для существующей QGraphics-карты."""
 
-from PySide6.QtCore import QObject, Qt, QTimer
-from PySide6.QtGui import QPixmap
-from PySide6.QtWidgets import QLabel
+from PySide6.QtCore import QObject, QRectF, Qt, QTimer
+from PySide6.QtGui import QColor, QPainterPath, QPen
+from PySide6.QtWidgets import QGraphicsItem, QLabel
 
 from streetjev.infrastructure.map_tiles import DEFAULT_TILE_URL, TileClient, visible_tiles
+
+
+class RoadTile(QGraphicsItem):
+    """Только линии. Нет фоновой заливки, полигонов land/water/buildings и цветного стиля OSM."""
+
+    def __init__(self, key, details):
+        super().__init__()
+        self.details = details
+        zoom, x, y = key
+        size = 360 / 2**zoom
+        left, top = -180 + x * size, -180 + y * size
+        self.rectangle = QRectF(left, top, size, size)
+        self.paths = (QPainterPath(), QPainterPath())
+        for major, points in details["roads"]:
+            path = self.paths[int(major)]
+            path.moveTo(left + points[0][0] * size, top + points[0][1] * size)
+            for px, py in points[1:]:
+                path.lineTo(left + px * size, top + py * size)
+        self.labels = [
+            (left + x * size, top + y * size, name, population) for x, y, name, population in details["labels"]
+        ]
+        self.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
+        self.setZValue(4)
+
+    def boundingRect(self):
+        return self.rectangle
+
+    def shape(self):
+        return QPainterPath()  # Выбор точки и региона проходит к исходной карте.
+
+    def paint(self, painter, option, widget=None):
+        painter.setClipRect(self.rectangle, Qt.ClipOperation.IntersectClip)
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        for major, path in enumerate(self.paths):
+            # Ориентиры остаются второстепенными на любом цвете тепловой карты.
+            color = QColor(135, 151, 160, 95 if major else 55)
+            pen = QPen(color, 0.85 if major else 0.55)
+            pen.setCosmetic(True)
+            painter.setPen(pen)
+            painter.drawPath(path)
 
 
 class TileLayer(QObject):
@@ -20,6 +60,10 @@ class TileLayer(QObject):
         self.timer.setSingleShot(True)
         self.timer.setInterval(180)
         self.timer.timeout.connect(self.refresh)
+        self.labels_timer = QTimer(self)
+        self.labels_timer.setSingleShot(True)
+        self.labels_timer.setInterval(40)
+        self.labels_timer.timeout.connect(self.update_labels)
         self.credit = QLabel(
             '<a href="https://www.openstreetmap.org/copyright">© OpenStreetMap contributors</a>', view.viewport()
         )
@@ -57,36 +101,55 @@ class TileLayer(QObject):
         keys = (
             visible_tiles(
                 (rectangle.left(), rectangle.top(), rectangle.right(), rectangle.bottom()),
-                self.view.transform().m11() * self.view.devicePixelRatioF(),
+                self.view.transform().m11(),  # Вектор остаётся чётким при любом DPI.
             )
             if self.enabled and self.view.isVisible()
             else []
         )
         self.wanted = keys
         for key in list(self.items):
-            if key not in keys:
+            # Предыдущий масштаб остаётся видимым до прихода новых тайлов.
+            if not keys or not rectangle.intersects(self.items[key].boundingRect()):
                 self.view.scene().removeItem(self.items.pop(key))
+            elif key not in keys:
+                self.items[key].setOpacity(0.45)
+            else:
+                self.items[key].setOpacity(1)
+        self.remove_fallbacks()
         self.credit.setVisible(bool(keys))
         self.view.set_detail_active(bool(self.items))
+        self.update_labels()
         self.client.select(keys)
 
-    def received(self, key, image):
+    def received(self, key, details):
         if not self.enabled or key not in self.wanted:
             return
-        if key not in self.items:
-            item = self.view.scene().addPixmap(QPixmap.fromImage(image))
-            zoom, x, y = key
-            size = 360 / 2**zoom
-            item.setScale(size / 256)
-            item.setPos(-180 + x * size, -180 + y * size)
-            item.setZValue(-10)
-            item.setTransformationMode(Qt.TransformationMode.SmoothTransformation)
-            item.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
+        if key not in self.items or self.items[key].details is not details:
+            if key in self.items:
+                self.view.scene().removeItem(self.items.pop(key))
+            item = RoadTile(key, details)
+            self.view.scene().addItem(item)
             self.items[key] = item
+        self.remove_fallbacks()
+        self.labels_timer.start()
         self.view.set_detail_active(True)
         self.credit.setText(self.credit_text)
         self.position_credit()
-        self.credit.setToolTip("Города, дороги и названия · OpenStreetMap")
+        self.credit.setToolTip("Векторные дороги и населённые пункты · OpenStreetMap")
+
+    def update_labels(self):
+        unique = {
+            (round(x, 7), round(y, 7), name): (x, y, name, population)
+            for key, item in sorted(self.items.items(), key=lambda entry: entry[0] in self.wanted)
+            for x, y, name, population in item.labels
+        }
+        self.view.set_detail_labels(sorted(unique.values(), key=lambda item: item[3], reverse=True))
+
+    def remove_fallbacks(self):
+        complete = all(key in self.items for key in self.wanted)
+        old = [key for key in self.items if key not in self.wanted]
+        for key in old if complete else old[:-96]:
+            self.view.scene().removeItem(self.items.pop(key))
 
     def failed(self, message):
         self.credit.setText(self.credit_text + " · недоступно")
@@ -95,4 +158,5 @@ class TileLayer(QObject):
 
     def close(self):
         self.timer.stop()
+        self.labels_timer.stop()
         self.client.close()

@@ -121,7 +121,9 @@ def build_window(w, geography, demo):
     view.addWidget(button("Мир", w.show_world))
     view.addWidget(button("Лидер", w.focus_leader))
     w.details = QCheckBox("Детали")
-    w.details.setToolTip("Города, дороги и улицы OpenStreetMap. Нужен интернет; просмотренные тайлы кэшируются")
+    w.details.setToolTip(
+        "Нейтральные векторные дороги и названия населённых пунктов. Нужен интернет; данные кэшируются"
+    )
     view.addWidget(w.details)
     root.addLayout(view)
 
@@ -129,7 +131,11 @@ def build_window(w, geography, demo):
     canvas_layout = QGridLayout(canvas)
     canvas_layout.setContentsMargins(0, 0, 0, 0)
     w.map = MapView(w.catalog, geography)
-    w.tiles = TileLayer(w.map, w.data_dir / "map-cache")
+    from streetjev.infrastructure.map_tiles import DEFAULT_TILE_URL
+
+    w.tiles = TileLayer(
+        w.map, w.data_dir / "map-vector-cache", template=str(w.settings.value("map_vector_url", DEFAULT_TILE_URL))
+    )
     w.details.toggled.connect(w.tiles.set_enabled)
     w.details.setChecked(str(w.settings.value("map_details", "true")).lower() == "true" and not demo)
     w.map.answer_clicked.connect(w.save_answer)

@@ -170,6 +170,7 @@ def test_raw_replay_matches_live_profile_and_keeps_db_readonly(catalog, tmp_path
     actual = replay(samples[0], parameters)
     assert actual.countries == pytest.approx(expected.countries)
     assert actual.regions == pytest.approx(expected.regions)
+    assert actual.cells == expected.cells
     assert actual.effective_frames == pytest.approx(expected.effective_frames)
     assert actual.frames == expected.frames
     assert path.read_bytes() == before

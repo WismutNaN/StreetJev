@@ -11,9 +11,9 @@ def test_visible_tiles_scale_limits_and_clipping():
         keys = visible_tiles(bounds, scale)
         assert 1 <= len(keys) <= 80
         for zoom, x, y in keys:
-            assert 0 <= zoom <= 19
+            assert 0 <= zoom <= 14
             assert 0 <= x < 2**zoom and 0 <= y < 2**zoom
-        assert keys[0][0] == min(19, math.ceil(math.log2(360 * scale / 256)))
+        assert keys[0][0] == min(14, math.ceil(math.log2(360 * scale / 512)))
 
 
 def test_no_prefetch_or_wrapping_beyond_date_line():

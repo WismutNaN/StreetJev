@@ -1,8 +1,8 @@
 import math
 from itertools import pairwise
 
-from PySide6.QtCore import QRectF, Qt, Signal
-from PySide6.QtGui import QBrush, QColor, QPainter, QPainterPath, QPen
+from PySide6.QtCore import QPointF, QRectF, Qt, Signal
+from PySide6.QtGui import QBrush, QColor, QFont, QPainter, QPainterPath, QPen, QStaticText
 from PySide6.QtWidgets import QGraphicsItem, QGraphicsPathItem, QGraphicsScene, QGraphicsView
 
 from streetjev.domain.geography import GeoCatalog
@@ -66,6 +66,12 @@ class MapView(QGraphicsView):
         self._answer_press = None
         self.answer_marker = None
         self.detail_active = False
+        self.detail_labels = []
+        self._label_key = None
+        self._label_layout = []
+        self._label_texts = {}
+        self._label_font = QFont("Segoe UI")
+        self._label_font.setPixelSize(11)
         self.cell_items = {}
         self.cells_by_code = {}
         for feature in geography["features"]:
@@ -116,10 +122,67 @@ class MapView(QGraphicsView):
         self.viewport_changed.emit()
 
     def set_detail_active(self, enabled):
-        if self.detail_active != enabled:
-            self.detail_active = enabled
-            if self.snapshot:
-                self.update_snapshot(self.snapshot)
+        self.detail_active = enabled
+
+    def set_detail_labels(self, labels):
+        self.detail_labels = labels
+        self._label_key = None
+        names = {item[2] for item in labels}
+        self._label_texts = {name: text for name, text in self._label_texts.items() if name in names}
+        self.viewport().update()
+
+    def detail_label_layout(self):
+        transform = self.viewportTransform()
+        marker = self.mapFromScene(self.answer_marker.pos()) if self.answer_marker else None
+        key = (transform.m11(), transform.m22(), transform.dx(), transform.dy(), self.viewport().size(), marker)
+        if key == self._label_key:
+            return self._label_layout
+        occupied, layout = [], []
+        viewport = QRectF(self.viewport().rect())
+        visible = self.mapToScene(self.viewport().rect()).boundingRect()
+        limit = max(6, min(32, self.viewport().width() * self.viewport().height() // 22000))
+        for x, y, name, _population in self.detail_labels:
+            if not visible.contains(QPointF(x, y)):
+                continue
+            text = self._label_texts.get(name)
+            if text is None:
+                text = QStaticText(name)
+                text.setTextFormat(Qt.TextFormat.PlainText)
+                text.prepare(font=self._label_font)
+                self._label_texts[name] = text
+            point = QPointF(self.mapFromScene(QPointF(x, y)))
+            origin = point + QPointF(4, -text.size().height() - 2)
+            box = QRectF(origin, text.size()).adjusted(-18, -9, 18, 9)
+            if (
+                not viewport.contains(box)
+                or any(box.intersects(previous) for previous in occupied)
+                or marker is not None
+                and box.intersects(QRectF(marker.x() - 8, marker.y() - 8, 16, 16))
+            ):
+                continue
+            occupied.append(box)
+            layout.append((point, origin, text))
+            if len(layout) >= limit:
+                break
+        self._label_key, self._label_layout = key, layout
+        return layout
+
+    def drawForeground(self, painter, rect):
+        super().drawForeground(painter, rect)
+        if not self.detail_labels:
+            return
+        painter.save()
+        painter.resetTransform()
+        painter.setFont(self._label_font)
+        for point, origin, text in self.detail_label_layout():
+            painter.setPen(QColor(12, 22, 29, 180))
+            painter.drawStaticText(origin + QPointF(0, 1), text)
+            painter.setPen(QColor(165, 179, 188, 210))
+            painter.drawStaticText(origin, text)
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(QColor(150, 164, 173, 170))
+            painter.drawEllipse(point, 1.2, 1.2)
+        painter.restore()
 
     def show_world(self):
         self.auto_fit = True
@@ -306,13 +369,11 @@ class MapView(QGraphicsView):
             if (not country and self.level != "countries") or self.level == "local":
                 # Массу страны нельзя окрашивать по общей шкале совместных региональных оценок.
                 fill = 0
-            color = heat_color(fill)
-            if self.detail_active:
-                color.setAlphaF(0 if self.answer_mode or fill == 0 else 0.26)
+            color = heat_color(0 if self.answer_mode else fill)
             item.setBrush(QBrush(color))
             pen = item.pen()
-            pen.setColor(QColor("#657d89") if self.detail_active else QColor("#486071"))
-            pen.setWidthF(0.6 if self.detail_active else 0.55)
+            pen.setColor(QColor("#486071"))
+            pen.setWidthF(0.55)
             item.setPen(pen)
             suffix = f"Оценка: {format_score(probability)}" if active else "Пока нет наблюдений"
             if country and active:
@@ -339,7 +400,7 @@ class MapView(QGraphicsView):
                 pen = QPen(color, 1.4)
                 pen.setCosmetic(True)
                 item.setPen(pen)
-                color.setAlphaF(0 if self.answer_mode else 0.30 if self.detail_active else 0.80)
+                color.setAlphaF(0 if self.answer_mode else 0.80)
                 item.setBrush(color)
                 item.setZValue(3)
                 item.setData(2, cell.code)
